@@ -1,0 +1,28 @@
+# 排除构建目录
+build/
+dist/
+
+# 排除Python缓存文件
+__pycache__/
+*.pyc
+
+# 排除日志文件
+*.log
+
+# 排除虚拟环境
+venv/
+env/
+
+# 排除编辑器配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 排除操作系统文件
+.DS_Store
+Thumbs.db
+
+# 排除个人配置文件
+*.local
+*.ini
