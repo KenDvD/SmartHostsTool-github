@@ -362,9 +362,7 @@ class AboutWindow:
                 self.usage_frame = ttk.Labelframe(
                     self.usage_container, text="软件详细使用说明", padding=12
                 )
-                self.usage_frame.grid(row=0, column=0, sticky="nsew")
-                self.usage_container.grid_rowconfigure(0, weight=1)
-
+                
                 usage_content = """
 软件详细使用说明：
 
@@ -384,15 +382,23 @@ class AboutWindow:
 5. 自动排序：测速完成后结果按延迟自动排序，方便选择最优 IP
                 """.strip()
 
-                text = ScrolledText(
-                    self.usage_frame, wrap=WORD, font=("微软雅黑", 10), height=12
-                )
+                # 使用标准Text组件配合Scrollbar，确保内容能正确显示
+                text_frame = ttk.Frame(self.usage_frame)
+                text_frame.pack(fill=BOTH, expand=True, padx=5, pady=5)
+                
+                scrollbar = ttk.Scrollbar(text_frame)
+                scrollbar.pack(side=RIGHT, fill=Y)
+                
+                text = ttk.Text(text_frame, wrap=WORD, font=("微软雅黑", 10), height=12,
+                              yscrollcommand=scrollbar.set)
                 text.insert("1.0", usage_content)
                 text.configure(state="disabled")
-                text.pack(fill=BOTH, expand=True)
+                text.pack(side=LEFT, fill=BOTH, expand=True)
+                
+                scrollbar.configure(command=text.yview)
 
-            else:
-                self.usage_frame.grid(row=0, column=0, sticky="nsew")
+            # 使用pack布局代替grid布局，确保内容能正确显示
+            self.usage_frame.pack(fill=BOTH, expand=True, padx=5, pady=5)
 
             self.usage_expanded = True
             self.usage_btn.configure(text="收起使用说明")
@@ -403,7 +409,7 @@ class AboutWindow:
                 pass
         else:
             if self.usage_frame:
-                self.usage_frame.grid_remove()
+                self.usage_frame.pack_forget()
 
             self.usage_expanded = False
             self.usage_btn.configure(text="展开使用说明")

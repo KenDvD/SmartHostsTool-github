@@ -417,7 +417,8 @@ class HostsOptimizer(ttk.Frame):
                 parts = re.split(r"\s+", line)
                 if len(parts) >= 2:
                     ip, domain = parts[0], parts[1]
-                    if domain.endswith(GITHUB_TARGET_DOMAIN):
+                    # 匹配所有GitHub相关域名
+                    if "github" in domain:
                         self.remote_hosts_data.append((ip, domain))
 
             self.master.after(0, self._update_remote_hosts_ui)
@@ -497,7 +498,7 @@ class HostsOptimizer(ttk.Frame):
 
     def _add_test_result(self, ip: str, domain: str, delay: int, status: str, selected: bool):
         self.test_results.append((ip, domain, delay, status, selected))
-        self.result_tree.insert("", "end", values=["✓" if selected else "", ip, domain, delay, status])
+        self.result_tree.insert("", "end", values=["□" if not selected else "✓", ip, domain, delay, status])
 
         self.completed_tests += 1
         progress = (self.completed_tests / self.total_tests) * 100
@@ -513,7 +514,7 @@ class HostsOptimizer(ttk.Frame):
 
         sorted_results = sorted(self.test_results, key=lambda x: x[2])
         for ip, domain, delay, status, selected in sorted_results:
-            self.result_tree.insert("", "end", values=["✓" if selected else "", ip, domain, delay, status])
+            self.result_tree.insert("", "end", values=["□" if not selected else "✓", ip, domain, delay, status])
 
         if current_selection:
             for item in self.result_tree.get_children():
@@ -570,7 +571,7 @@ class HostsOptimizer(ttk.Frame):
             if result[0] == ip and result[1] == domain:
                 new_selected = not result[4]
                 self.test_results[i] = (ip, domain, result[2], result[3], new_selected)
-                self.result_tree.item(item, values=["✓" if new_selected else "", ip, domain, result[2], result[3]])
+                self.result_tree.item(item, values=["✓" if new_selected else "□", ip, domain, result[2], result[3]])
                 break
 
     # -------------------------
