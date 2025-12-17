@@ -1,0 +1,1680 @@
+--- a/main.py
++++ b/main.py
+@@ -1,43 +1,47 @@
++# -*- coding: utf-8 -*-
++"""
++SmartHostsTool - 主程序
++
++本次优化重点：
++1) 清理 main.py 中与业务无关/多余的调试与日志相关代码（例如：无用的 PIL 检测、重复的 ttk 导入等）。
++2) 修复一个隐藏 bug：load_presets() 在 UI 创建前调用，会导致预设列表无法正确加载。
++3) AboutWindow 改为 Toplevel 弹窗后，show_about() 逻辑同步调整（不再创建第二个 mainloop）。
++"""
++
++from __future__ import annotations
++
++import concurrent.futures
++import ctypes
++import json
+ import os
+ import re
+-import json
++import socket
++import subprocess
+ import sys
+-import subprocess
+ import threading
+-import socket
++from datetime import datetime
++from typing import List, Tuple, Optional
++
+ import requests
+-import concurrent.futures
+-from tkinter import ttk, messagebox, simpledialog
+ import ttkbootstrap as ttk
+ from ttkbootstrap.constants import *
+-import ctypes
+-from datetime import datetime
+-
+-# 引入about_gui模块
++from tkinter import messagebox, simpledialog
++
+ from about_gui import AboutWindow
+ 
+-# 获取程序所在目录
+-base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+-
+-# 检查PIL库
+-try:
+-    from PIL import Image, ImageTk
+-except ImportError:
+-    pass  # 静默处理，避免干扰用户
+-
+-# 检查是否以管理员身份运行
+-def is_admin():
+-    try:
+-        return ctypes.windll.shell32.IsUserAnAdmin()
+-    except:
+-        return False
+-
+-# 如果不是管理员，提示并退出
+-if not is_admin():
+-    messagebox.showerror("权限不足", "请以管理员身份运行程序，否则无法修改 Hosts 文件！")
+-    sys.exit(1)
+-
+-# 全局常量配置
++# ---------------------------------------------------------------------
++# 资源路径（兼容 PyInstaller）
++# ---------------------------------------------------------------------
++BASE_PATH = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
++
++
++def resource_path(*parts: str) -> str:
++    return os.path.join(BASE_PATH, *parts)
++
++
++# ---------------------------------------------------------------------
++# 常量配置
++# ---------------------------------------------------------------------
+ GITHUB_TARGET_DOMAIN = "github.com"
+ REMOTE_HOSTS_URL = "https://github-hosts.tinsfox.com/hosts"
+ HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+@@ -45,89 +49,116 @@
+ HOSTS_END_MARK = "# === SmartHostsTool End ==="
+ 
+ 
++# ---------------------------------------------------------------------
++# 权限检查
++# ---------------------------------------------------------------------
++def is_admin() -> bool:
++    """Windows 管理员权限检测"""
++    if sys.platform != "win32":
++        return True
++    try:
++        return bool(ctypes.windll.shell32.IsUserAnAdmin())
++    except Exception:
++        return False
++
++
++def show_admin_required_and_exit() -> None:
++    """
++    没有管理员权限时提示并退出。
++    使用 Windows 原生 MessageBox，避免在未创建主窗口前弹 Tk 的 messagebox 导致样式/根窗口问题。
++    """
++    if sys.platform == "win32":
++        try:
++            ctypes.windll.user32.MessageBoxW(
++                0,
++                "请以管理员身份运行程序，否则无法修改 Hosts 文件！",
++                "权限不足",
++                0x10,  # MB_ICONERROR
++            )
++        except Exception:
++            pass
++    else:
++        print("需要管理员权限运行。")
++    raise SystemExit(1)
++
++
++# ---------------------------------------------------------------------
++# 主界面
++# ---------------------------------------------------------------------
+ class HostsOptimizer(ttk.Frame):
+     def __init__(self, master=None):
+         super().__init__(master, padding=10)
+         self.master = master
++
+         self.master.title("智能 Hosts 测速工具")
+         self.master.geometry("1000x600")
+         self.master.resizable(True, True)
+ 
+-        # 设置主题
+-        self.style = ttk.Style("darkly")
+-
+         # 数据存储
+-        self.remote_hosts_data = []  # 仅GitHub时加载的远程Hosts全部数据
+-        self.smart_resolved_ips = []  # 智能解析的IP数据（所有域名通用）
+-        self.custom_presets = []  # 自定义预设网址列表
+-        self.test_results = []  # 测速结果 (ip, domain, delay, status, selected)
+-        self.presets_file = os.path.join(base_path, "presets.json")
++        self.remote_hosts_data: List[Tuple[str, str]] = []  # 仅 GitHub 时加载的远程 Hosts
++        self.smart_resolved_ips: List[Tuple[str, str]] = []  # 智能解析的 IP（所有域名通用）
++        self.custom_presets: List[str] = []  # 自定义预设网址列表
++        self.test_results: List[Tuple[str, str, int, str, bool]] = []  # (ip, domain, delay, status, selected)
++
++        self.presets_file = resource_path("presets.json")
++
+         # 选中状态标记
+-        self.current_selected_presets = []  # 存储选中的预设网址
+-        self.is_github_selected = False  # 是否选中了GitHub域名
+-        # 测速控制标志
+-        self.stop_test = False  # 暂停/停止测速标志
+-        self.executor = None  # 线程池对象
+-
+-        # 加载预设
++        self.current_selected_presets: List[str] = []
++        self.is_github_selected = False
++
++        # 测速控制
++        self.stop_test = False
++        self.executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
++
++        # About 窗口引用（防止重复打开）
++        self._about: Optional[AboutWindow] = None
++
++        # 先创建 UI，再加载预设（修复预设列表加载时机问题）
++        self.create_widgets()
+         self.load_presets()
+ 
+-        # 创建UI
+-        self.create_widgets()
+-
+-        # 初始状态：不自动加载任何数据，等待用户选择预设后触发
+-
++    # -------------------------
++    # UI
++    # -------------------------
+     def create_widgets(self):
+         # 顶部区域 - 标题和功能按钮
+         top_frame = ttk.Frame(self)
+         top_frame.pack(fill=X, pady=(0, 10))
+ 
+-        # 标题
+-        title_label = ttk.Label(top_frame, text="智能 Hosts 测速工具", font= ("微软雅黑", 16, "bold"))
++        title_label = ttk.Label(top_frame, text="智能 Hosts 测速工具", font=("微软雅黑", 16, "bold"))
+         title_label.pack(side=LEFT, padx=10)
+ 
+-        # 功能按钮
+         button_frame = ttk.Frame(top_frame)
+         button_frame.pack(side=RIGHT)
+ 
+-        # 关于按钮
+-        self.about_btn = ttk.Button(
+-            button_frame, text="关于", command=self.show_about,
+-            bootstyle=INFO, width=8
+-        )
++        self.about_btn = ttk.Button(button_frame, text="关于", command=self.show_about, bootstyle=INFO, width=8)
+         self.about_btn.pack(side=LEFT, padx=5)
+ 
+-        # 刷新远程Hosts按钮（仅GitHub时可用）
+         self.refresh_remote_btn = ttk.Button(
+-            button_frame, text="刷新远程 Hosts", command=self.refresh_remote_hosts,
+-            bootstyle=SUCCESS, width=15, state=DISABLED  # 初始禁用
++            button_frame,
++            text="刷新远程 Hosts",
++            command=self.refresh_remote_hosts,
++            bootstyle=SUCCESS,
++            width=15,
++            state=DISABLED,
+         )
+         self.refresh_remote_btn.pack(side=LEFT, padx=5)
+ 
+-        self.flush_dns_btn = ttk.Button(
+-            button_frame, text="刷新 DNS", command=self.flush_dns,
+-            bootstyle=INFO, width=10
+-        )
++        self.flush_dns_btn = ttk.Button(button_frame, text="刷新 DNS", command=self.flush_dns, bootstyle=INFO, width=10)
+         self.flush_dns_btn.pack(side=LEFT, padx=5)
+ 
+-        # 查看Hosts文件按钮
+         self.view_hosts_btn = ttk.Button(
+-            button_frame, text="查看 Hosts 文件", command=self.view_hosts_file,
+-            bootstyle=SECONDARY, width=12
++            button_frame, text="查看 Hosts 文件", command=self.view_hosts_file, bootstyle=SECONDARY, width=12
+         )
+         self.view_hosts_btn.pack(side=LEFT, padx=5)
+ 
+-        # 开始测速按钮
+         self.start_test_btn = ttk.Button(
+-            button_frame, text="开始测速", command=self.start_test,
+-            bootstyle=PRIMARY, width=10, state=DISABLED  # 初始禁用
++            button_frame, text="开始测速", command=self.start_test, bootstyle=PRIMARY, width=10, state=DISABLED
+         )
+         self.start_test_btn.pack(side=LEFT, padx=5)
+ 
+-        # 暂停测速按钮
+         self.pause_test_btn = ttk.Button(
+-            button_frame, text="暂停测速", command=self.pause_test,
+-            bootstyle=WARNING, width=10, state=DISABLED
++            button_frame, text="暂停测速", command=self.pause_test, bootstyle=WARNING, width=10, state=DISABLED
+         )
+         self.pause_test_btn.pack(side=LEFT, padx=5)
+ 
+@@ -139,54 +170,36 @@
+         left_notebook = ttk.Notebook(main_frame, width=350)
+         left_notebook.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 10))
+ 
+-        # 远程Hosts解析结果标签页（仅GitHub时显示）
++        # 远程 Hosts 标签页（仅 GitHub）
+         self.remote_frame = ttk.Frame(left_notebook)
+         left_notebook.add(self.remote_frame, text="远程 Hosts 数据（仅GitHub）")
+ 
+-        # 远程Hosts结果列表
+-        self.remote_tree = ttk.Treeview(
+-            self.remote_frame, columns=["ip", "domain"], show="headings", height=15
+-        )
++        self.remote_tree = ttk.Treeview(self.remote_frame, columns=["ip", "domain"], show="headings", height=15)
+         self.remote_tree.heading("ip", text="IP 地址")
+         self.remote_tree.heading("domain", text="域名")
+         self.remote_tree.column("ip", width=120)
+         self.remote_tree.column("domain", width=200)
+         self.remote_tree.pack(fill=BOTH, expand=True, pady=(0, 10))
+ 
+-        # 自定义预设网址标签页
++        # 自定义预设标签页
+         self.custom_frame = ttk.Frame(left_notebook)
+         left_notebook.add(self.custom_frame, text="自定义预设网址")
+ 
+-        # 自定义预设按钮
+         custom_btn_frame = ttk.Frame(self.custom_frame)
+         custom_btn_frame.pack(fill=X, pady=(0, 10))
+ 
+-        self.add_preset_btn = ttk.Button(
+-            custom_btn_frame, text="添加预设", command=self.add_preset,
+-            bootstyle=SUCCESS
+-        )
++        self.add_preset_btn = ttk.Button(custom_btn_frame, text="添加预设", command=self.add_preset, bootstyle=SUCCESS)
+         self.add_preset_btn.pack(side=LEFT, padx=5)
+ 
+-        self.delete_preset_btn = ttk.Button(
+-            custom_btn_frame, text="删除预设", command=self.delete_preset,
+-            bootstyle=DANGER
+-        )
++        self.delete_preset_btn = ttk.Button(custom_btn_frame, text="删除预设", command=self.delete_preset, bootstyle=DANGER)
+         self.delete_preset_btn.pack(side=LEFT, padx=5)
+ 
+-        # 智能解析预设按钮（触发IP解析）
+-        self.resolve_preset_btn = ttk.Button(
+-            custom_btn_frame, text="智能解析IP", command=self.resolve_selected_presets,
+-            bootstyle=INFO
+-        )
++        self.resolve_preset_btn = ttk.Button(custom_btn_frame, text="智能解析IP", command=self.resolve_selected_presets, bootstyle=INFO)
+         self.resolve_preset_btn.pack(side=LEFT, padx=5)
+ 
+-        # 自定义预设列表（支持多选）
+-        self.preset_tree = ttk.Treeview(
+-            self.custom_frame, columns=["domain"], show="headings", height=14
+-        )
++        self.preset_tree = ttk.Treeview(self.custom_frame, columns=["domain"], show="headings", height=14)
+         self.preset_tree.heading("domain", text="网址")
+         self.preset_tree.column("domain", width=300)
+-        # 开启多选模式
+         self.preset_tree.configure(selectmode="extended")
+         self.preset_tree.pack(fill=BOTH, expand=True)
+ 
+@@ -194,7 +207,6 @@
+         right_frame = ttk.Frame(main_frame)
+         right_frame.pack(side=RIGHT, fill=BOTH, expand=True)
+ 
+-        # 测速结果表格（复选框列）
+         self.result_tree = ttk.Treeview(
+             right_frame, columns=["select", "ip", "domain", "delay", "status"], show="headings"
+         )
+@@ -203,7 +215,6 @@
+         self.result_tree.heading("domain", text="域名")
+         self.result_tree.heading("delay", text="延迟 (ms)")
+         self.result_tree.heading("status", text="状态")
+-        # 调整列宽
+         self.result_tree.column("select", width=60, anchor="center")
+         self.result_tree.column("ip", width=120)
+         self.result_tree.column("domain", width=200)
+@@ -211,7 +222,6 @@
+         self.result_tree.column("status", width=100)
+         self.result_tree.pack(fill=BOTH, expand=True, pady=(0, 10))
+ 
+-        # 绑定复选框点击事件
+         self.result_tree.bind("<Button-1>", self.on_tree_click)
+ 
+         # 按钮区域
+@@ -219,70 +229,92 @@
+         btn_frame.pack(fill=X, pady=(0, 10))
+ 
+         self.write_selected_btn = ttk.Button(
+-            btn_frame, text="写入选中到 Hosts", command=self.write_selected_to_hosts,
+-            bootstyle=PRIMARY, width=20
++            btn_frame, text="写入选中到 Hosts", command=self.write_selected_to_hosts, bootstyle=PRIMARY, width=20
+         )
+         self.write_selected_btn.pack(side=RIGHT, padx=5)
+ 
+-        # 一键写入最优IP按钮
+         self.write_best_btn = ttk.Button(
+-            btn_frame, text="一键写入最优IP", command=self.write_best_ip_to_hosts,
+-            bootstyle=SUCCESS, width=20
++            btn_frame, text="一键写入最优IP", command=self.write_best_ip_to_hosts, bootstyle=SUCCESS, width=20
+         )
+         self.write_best_btn.pack(side=RIGHT, padx=5)
+ 
+-        # 底部进度和状态区域
++        # 底部
+         bottom_frame = ttk.Frame(self)
+         bottom_frame.pack(fill=X, pady=(10, 0))
+ 
+-        # 进度条
+-        self.progress = ttk.Progressbar(bottom_frame, orient=HORIZONTAL, length=100, mode='determinate')
++        self.progress = ttk.Progressbar(bottom_frame, orient=HORIZONTAL, length=100, mode="determinate")
+         self.progress.pack(side=LEFT, fill=X, expand=True, padx=(0, 10))
+ 
+-        # 状态标签
+         self.status_label = ttk.Label(bottom_frame, text="就绪", bootstyle=INFO)
+         self.status_label.pack(side=RIGHT)
+ 
+-        # 绑定预设选择事件
+         self.preset_tree.bind("<<TreeviewSelect>>", self.on_preset_select)
+ 
+         # 显示界面
+         self.pack(fill=BOTH, expand=True)
+ 
++    # -------------------------
++    # About
++    # -------------------------
+     def show_about(self):
+-        """显示关于窗口"""
+-        self.about_window = AboutWindow()
+-
++        """显示关于窗口（避免重复打开）"""
++        try:
++            if self._about and self._about.window.winfo_exists():
++                self._about.window.lift()
++                self._about.window.focus_force()
++                return
++        except Exception:
++            pass
++        self._about = AboutWindow(self.master)
++
++    # -------------------------
++    # Presets
++    # -------------------------
+     def load_presets(self):
+-        """加载预设网址列表"""
++        """加载预设网址列表并刷新 TreeView"""
++        default_presets = ["github.com", "bitbucket.org", "bilibili.com", "baidu.com"]
++
+         try:
+             if os.path.exists(self.presets_file):
+-                with open(self.presets_file, 'r', encoding='utf-8') as f:
++                with open(self.presets_file, "r", encoding="utf-8") as f:
+                     self.custom_presets = json.load(f)
+-                
+-                # 清空现有项
+-                for item in self.preset_tree.get_children():
+-                    self.preset_tree.delete(item)
+-                
+-                # 添加预设项
+-                for domain in self.custom_presets:
+-                    self.preset_tree.insert('', 'end', values=[domain])
+-        except Exception as e:
+-            messagebox.showerror("错误", f"加载预设失败: {str(e)}")
+-            # 使用默认预设
+-            self.custom_presets = ["github.com", "bitbucket.org", "bilibili.com", "baidu.com"]
++            else:
++                self.custom_presets = default_presets
++        except Exception as e:
++            # 不生成额外日志文件，直接提示
++            messagebox.showerror("错误", f"加载预设失败: {e}")
++            self.custom_presets = default_presets
++
++        # 刷新 TreeView
++        for item in self.preset_tree.get_children():
++            self.preset_tree.delete(item)
++        for domain in self.custom_presets:
++            self.preset_tree.insert("", "end", values=[domain])
++
++    def save_presets(self):
++        """保存预设到文件"""
++        try:
++            with open(self.presets_file, "w", encoding="utf-8") as f:
++                json.dump(self.custom_presets, f, ensure_ascii=False, indent=2)
++        except Exception as e:
++            messagebox.showerror("错误", f"保存预设失败: {e}")
+ 
+     def add_preset(self):
+         """添加新的预设网址"""
+         domain = simpledialog.askstring("添加预设", "请输入域名（例如：example.com）:")
+-        if domain and domain not in self.custom_presets:
+-            # 简单验证域名格式
+-            if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$', domain):
+-                self.custom_presets.append(domain)
+-                self.preset_tree.insert('', 'end', values=[domain])
+-                self.save_presets()
+-            else:
+-                messagebox.showerror("格式错误", "请输入有效的域名格式（例如：example.com）")
++        if not domain:
++            return
++        domain = domain.strip().lower()
++        if domain in self.custom_presets:
++            return
++
++        # 简单验证域名格式
++        if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$", domain):
++            self.custom_presets.append(domain)
++            self.preset_tree.insert("", "end", values=[domain])
++            self.save_presets()
++        else:
++            messagebox.showerror("格式错误", "请输入有效的域名格式（例如：example.com）")
+ 
+     def delete_preset(self):
+         """删除选中的预设网址"""
+@@ -290,8 +322,7 @@
+         if not selected_items:
+             messagebox.showinfo("提示", "请先选择要删除的预设")
+             return
+-            
+-        # 确认删除
++
+         if messagebox.askyesno("确认", f"确定要删除选中的 {len(selected_items)} 个预设吗？"):
+             for item in selected_items:
+                 domain = self.preset_tree.item(item, "values")[0]
+@@ -300,23 +331,16 @@
+                 self.preset_tree.delete(item)
+             self.save_presets()
+ 
+-    def save_presets(self):
+-        """保存预设到文件"""
+-        try:
+-            with open(self.presets_file, 'w', encoding='utf-8') as f:
+-                json.dump(self.custom_presets, f, ensure_ascii=False, indent=2)
+-        except Exception as e:
+-            messagebox.showerror("错误", f"保存预设失败: {str(e)}")
+-
+-    def on_preset_select(self, event):
++    # -------------------------
++    # Selection & Resolve
++    # -------------------------
++    def on_preset_select(self, _event):
+         """处理预设选择事件"""
+         selected_items = self.preset_tree.selection()
+         self.current_selected_presets = [self.preset_tree.item(item, "values")[0] for item in selected_items]
+-        
+-        # 检查是否选中了GitHub域名
++
+         self.is_github_selected = GITHUB_TARGET_DOMAIN in self.current_selected_presets
+-        
+-        # 根据选择状态更新按钮状态
++
+         if self.current_selected_presets:
+             self.resolve_preset_btn.config(state=NORMAL)
+             self.start_test_btn.config(state=NORMAL if (self.remote_hosts_data or self.smart_resolved_ips) else DISABLED)
+@@ -327,219 +351,170 @@
+             self.refresh_remote_btn.config(state=DISABLED)
+ 
+     def resolve_selected_presets(self):
+-        """解析选中的预设网址的IP"""
++        """解析选中的预设网址的 IP"""
+         if not self.current_selected_presets:
+             return
+-            
++
+         self.status_label.config(text="正在解析IP地址...", bootstyle=INFO)
+         self.resolve_preset_btn.config(state=DISABLED)
+-        
+-        # 清空之前的解析结果
++
+         self.smart_resolved_ips = []
+-        
+-        # 在新线程中执行解析，避免UI卡顿
+         threading.Thread(target=self._resolve_ips_thread, daemon=True).start()
+ 
+     def _resolve_ips_thread(self):
+-        """IP解析线程"""
+         try:
+             for domain in self.current_selected_presets:
+                 try:
+-                    # 获取域名对应的IP地址
+                     ip_addresses = socket.gethostbyname_ex(domain)[2]
+                     for ip in ip_addresses:
+                         self.smart_resolved_ips.append((ip, domain))
+                 except Exception as e:
+-                    self.master.after(0, lambda d=domain, err=e: 
+-                        messagebox.showerror("解析错误", f"解析 {d} 失败: {str(err)}"))
+-            
+-            # 更新UI
++                    self.master.after(0, lambda d=domain, err=e: messagebox.showerror("解析错误", f"解析 {d} 失败: {err}"))
++
+             self.master.after(0, self._update_resolve_ui)
+         except Exception as e:
+-            self.master.after(0, lambda err=e: 
+-                messagebox.showerror("错误", f"解析过程出错: {str(err)}"))
++            self.master.after(0, lambda err=e: messagebox.showerror("错误", f"解析过程出错: {err}"))
+             self.master.after(0, lambda: self.status_label.config(text="解析失败", bootstyle=DANGER))
+             self.master.after(0, lambda: self.resolve_preset_btn.config(state=NORMAL))
+ 
+     def _update_resolve_ui(self):
+-        """更新解析结果UI"""
+-        # 清空远程Hosts列表（如果有）
+         for item in self.remote_tree.get_children():
+             self.remote_tree.delete(item)
+-            
+-        # 显示解析结果到远程Hosts列表（仅GitHub）
++
+         if self.is_github_selected:
+             github_ips = [(ip, domain) for ip, domain in self.smart_resolved_ips if domain == GITHUB_TARGET_DOMAIN]
+             for ip, domain in github_ips:
+-                self.remote_tree.insert('', 'end', values=[ip, domain])
+-        
++                self.remote_tree.insert("", "end", values=[ip, domain])
++
+         self.status_label.config(text=f"解析完成，共找到 {len(self.smart_resolved_ips)} 个IP", bootstyle=SUCCESS)
+         self.resolve_preset_btn.config(state=NORMAL)
+         self.start_test_btn.config(state=NORMAL)
+ 
++    # -------------------------
++    # Remote hosts (GitHub only)
++    # -------------------------
+     def refresh_remote_hosts(self):
+-        """刷新远程GitHub Hosts数据"""
+         if not self.is_github_selected:
+             return
+-            
++
+         self.status_label.config(text="正在刷新远程Hosts...", bootstyle=INFO)
+         self.refresh_remote_btn.config(state=DISABLED)
+-        
+-        # 在新线程中获取远程数据
+         threading.Thread(target=self._fetch_remote_hosts, daemon=True).start()
+ 
+     def _fetch_remote_hosts(self):
+-        """获取远程Hosts数据线程"""
+-        try:
+-            response = requests.get(REMOTE_HOSTS_URL, timeout=10)
+-            response.raise_for_status()
+-            
+-            # 解析Hosts内容
+-            hosts_content = response.text
+-            lines = hosts_content.split('\n')
+-            
+-            # 清空之前的远程数据
++        try:
++            resp = requests.get(REMOTE_HOSTS_URL, timeout=10)
++            resp.raise_for_status()
++
++            hosts_content = resp.text
++            lines = hosts_content.splitlines()
++
+             self.remote_hosts_data = []
+-            
+-            # 提取IP和域名
+             for line in lines:
+                 line = line.strip()
+-                if line and not line.startswith('#'):
+-                    parts = re.split(r'\s+', line)
+-                    if len(parts) >= 2:
+-                        ip = parts[0]
+-                        domain = parts[1]
+-                        if domain.endswith(GITHUB_TARGET_DOMAIN):
+-                            self.remote_hosts_data.append((ip, domain))
+-            
+-            # 更新UI
++                if not line or line.startswith("#"):
++                    continue
++                parts = re.split(r"\s+", line)
++                if len(parts) >= 2:
++                    ip, domain = parts[0], parts[1]
++                    if domain.endswith(GITHUB_TARGET_DOMAIN):
++                        self.remote_hosts_data.append((ip, domain))
++
+             self.master.after(0, self._update_remote_hosts_ui)
+         except Exception as e:
+-            self.master.after(0, lambda err=e: 
+-                messagebox.showerror("获取失败", f"无法获取远程Hosts: {str(err)}"))
++            self.master.after(0, lambda err=e: messagebox.showerror("获取失败", f"无法获取远程Hosts: {err}"))
+             self.master.after(0, lambda: self.status_label.config(text="远程Hosts获取失败", bootstyle=DANGER))
+             self.master.after(0, lambda: self.refresh_remote_btn.config(state=NORMAL))
+ 
+     def _update_remote_hosts_ui(self):
+-        """更新远程Hosts UI"""
+-        # 清空现有项
+         for item in self.remote_tree.get_children():
+             self.remote_tree.delete(item)
+-        
+-        # 添加新数据
++
+         for ip, domain in self.remote_hosts_data:
+-            self.remote_tree.insert('', 'end', values=[ip, domain])
+-        
++            self.remote_tree.insert("", "end", values=[ip, domain])
++
+         self.status_label.config(text=f"远程Hosts刷新完成，共找到 {len(self.remote_hosts_data)} 条记录", bootstyle=SUCCESS)
+         self.refresh_remote_btn.config(state=NORMAL)
+         self.start_test_btn.config(state=NORMAL)
+ 
++    # -------------------------
++    # Speed test
++    # -------------------------
+     def start_test(self):
+-        """开始测速"""
+-        # 清空之前的测试结果
+         for item in self.result_tree.get_children():
+             self.result_tree.delete(item)
+         self.test_results = []
+-        
+-        # 准备测试数据（远程Hosts + 智能解析IP）
+-        test_data = []
++
++        test_data: List[Tuple[str, str]] = []
+         if self.remote_hosts_data:
+             test_data.extend(self.remote_hosts_data)
+         if self.smart_resolved_ips:
+             test_data.extend(self.smart_resolved_ips)
+-            
++
+         if not test_data:
+             messagebox.showinfo("提示", "没有可测试的IP地址，请先解析IP或刷新远程Hosts")
+             return
+-            
+-        # 更新按钮状态
++
+         self.start_test_btn.config(state=DISABLED)
+         self.pause_test_btn.config(state=NORMAL)
+         self.resolve_preset_btn.config(state=DISABLED)
+         self.refresh_remote_btn.config(state=DISABLED)
+         self.stop_test = False
+-        
+-        # 设置进度条
++
+         self.progress["value"] = 0
+         self.total_tests = len(test_data)
+         self.completed_tests = 0
+-        
+-        # 开始多线程测速
++
+         self.status_label.config(text="正在测速，请稍候...", bootstyle=INFO)
+         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+-        
+-        # 提交所有任务
++
+         for ip, domain in test_data:
+             if self.stop_test:
+                 break
+             self.executor.submit(self._test_ip_delay, ip, domain)
+-        
+-        # 监控任务完成情况
++
+         threading.Thread(target=self._monitor_test_completion, daemon=True).start()
+ 
+-    def _test_ip_delay(self, ip, domain):
+-        """测试IP延迟"""
+-        try:
+-            # 使用socket连接测试延迟
++    def _test_ip_delay(self, ip: str, domain: str):
++        try:
+             start_time = datetime.now()
+             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+-                s.settimeout(2)  # 2秒超时
+-                result = s.connect_ex((ip, 80))  # 连接到80端口
++                s.settimeout(2)
++                result = s.connect_ex((ip, 80))
+                 end_time = datetime.now()
+-                
+-                if result == 0 and not self.stop_test:
++
++                if self.stop_test:
++                    return
++
++                if result == 0:
+                     delay = int((end_time - start_time).total_seconds() * 1000)
+                     self.master.after(0, lambda: self._add_test_result(ip, domain, delay, "可用", False))
+-                elif not self.stop_test:
++                else:
+                     self.master.after(0, lambda: self._add_test_result(ip, domain, 9999, "超时", False))
+-        except Exception as e:
++        except Exception:
+             if not self.stop_test:
+                 self.master.after(0, lambda: self._add_test_result(ip, domain, 9999, "错误", False))
+ 
+-    def _add_test_result(self, ip, domain, delay, status, selected):
+-        """添加测试结果到列表"""
++    def _add_test_result(self, ip: str, domain: str, delay: int, status: str, selected: bool):
+         self.test_results.append((ip, domain, delay, status, selected))
+-        # 插入到TreeView并标记复选框状态
+-        self.result_tree.insert('', 'end', values=[
+-            "✓" if selected else "", 
+-            ip, 
+-            domain, 
+-            delay, 
+-            status
+-        ])
+-        
+-        # 更新进度
++        self.result_tree.insert("", "end", values=["✓" if selected else "", ip, domain, delay, status])
++
+         self.completed_tests += 1
+         progress = (self.completed_tests / self.total_tests) * 100
+-        self.master.after(0, lambda: self.progress.configure(value=progress))
+-        
+-        # 按延迟排序
++        self.progress.configure(value=progress)
++
+         self._sort_test_results()
+ 
+     def _sort_test_results(self):
+-        """按延迟排序测试结果"""
+-        # 先保存当前选择状态
+         current_selection = [self.result_tree.item(item, "values") for item in self.result_tree.selection()]
+-        
+-        # 清空现有项
++
+         for item in self.result_tree.get_children():
+             self.result_tree.delete(item)
+-            
+-        # 按延迟排序
++
+         sorted_results = sorted(self.test_results, key=lambda x: x[2])
+-        
+-        # 重新插入排序后的结果
+-        for result in sorted_results:
+-            ip, domain, delay, status, selected = result
+-            self.result_tree.insert('', 'end', values=[
+-                "✓" if selected else "", 
+-                ip, 
+-                domain, 
+-                delay, 
+-                status
+-            ])
+-        
+-        # 恢复选择状态（如果有）
++        for ip, domain, delay, status, selected in sorted_results:
++            self.result_tree.insert("", "end", values=["✓" if selected else "", ip, domain, delay, status])
++
+         if current_selection:
+             for item in self.result_tree.get_children():
+                 values = self.result_tree.item(item, "values")
+@@ -547,179 +522,167 @@
+                     self.result_tree.selection_add(item)
+ 
+     def _monitor_test_completion(self):
+-        """监控测试完成情况"""
+-        # 等待所有任务完成
+         if self.executor:
+             self.executor.shutdown(wait=True)
+-        
+-        # 更新UI
++
+         if not self.stop_test:
+-            self.master.after(0, lambda: self.status_label.config(
+-                text=f"测速完成，共测试 {self.total_tests} 个IP", bootstyle=SUCCESS
+-            ))
++            self.master.after(
++                0, lambda: self.status_label.config(text=f"测速完成，共测试 {self.total_tests} 个IP", bootstyle=SUCCESS)
++            )
+             self.master.after(0, lambda: self.progress.configure(value=100))
+         else:
+-            self.master.after(0, lambda: self.status_label.config(
+-                text=f"测速已暂停，已测试 {self.completed_tests}/{self.total_tests} 个IP", bootstyle=WARNING
+-            ))
+-        
+-        # 恢复按钮状态
++            self.master.after(
++                0,
++                lambda: self.status_label.config(
++                    text=f"测速已暂停，已测试 {self.completed_tests}/{self.total_tests} 个IP", bootstyle=WARNING
++                ),
++            )
++
+         self.master.after(0, lambda: self.start_test_btn.config(state=NORMAL))
+         self.master.after(0, lambda: self.pause_test_btn.config(state=DISABLED))
+         self.master.after(0, lambda: self.resolve_preset_btn.config(state=NORMAL))
+-        self.master.after(0, lambda: self.refresh_remote_btn.config(
+-            state=NORMAL if self.is_github_selected else DISABLED
+-        ))
++        self.master.after(0, lambda: self.refresh_remote_btn.config(state=NORMAL if self.is_github_selected else DISABLED))
+ 
+     def pause_test(self):
+-        """暂停测速"""
+         self.stop_test = True
+         self.status_label.config(text="正在停止测速...", bootstyle=WARNING)
+ 
++    # -------------------------
++    # Tree select
++    # -------------------------
+     def on_tree_click(self, event):
+-        """处理树形视图点击事件（复选框）"""
+         region = self.result_tree.identify_region(event.x, event.y)
+-        if region == "cell":
+-            column = int(self.result_tree.identify_column(event.x).replace('#', ''))
+-            if column == 1:  # 第一列是选择框
+-                item = self.result_tree.identify_row(event.y)
+-                if item:
+-                    values = self.result_tree.item(item, "values")
+-                    ip, domain = values[1], values[2]
+-                    
+-                    # 查找并更新状态
+-                    for i, result in enumerate(self.test_results):
+-                        if result[0] == ip and result[1] == domain:
+-                            new_selected = not result[4]
+-                            self.test_results[i] = (ip, domain, result[2], result[3], new_selected)
+-                            self.result_tree.item(item, values=[
+-                                "✓" if new_selected else "", 
+-                                ip, 
+-                                domain, 
+-                                result[2], 
+-                                result[3]
+-                            ])
+-                            break
+-
++        if region != "cell":
++            return
++
++        column = int(self.result_tree.identify_column(event.x).replace("#", ""))
++        if column != 1:
++            return
++
++        item = self.result_tree.identify_row(event.y)
++        if not item:
++            return
++
++        values = self.result_tree.item(item, "values")
++        ip, domain = values[1], values[2]
++
++        for i, result in enumerate(self.test_results):
++            if result[0] == ip and result[1] == domain:
++                new_selected = not result[4]
++                self.test_results[i] = (ip, domain, result[2], result[3], new_selected)
++                self.result_tree.item(item, values=["✓" if new_selected else "", ip, domain, result[2], result[3]])
++                break
++
++    # -------------------------
++    # Hosts file operations
++    # -------------------------
+     def write_selected_to_hosts(self):
+-        """将选中的IP写入Hosts文件"""
+         selected_ips = [(ip, domain) for ip, domain, _, _, selected in self.test_results if selected]
+-        
+         if not selected_ips:
+             messagebox.showinfo("提示", "请先选择要写入的IP地址")
+             return
+-            
+-        try:
+-            # 读取现有Hosts内容
+-            with open(HOSTS_PATH, 'r', encoding='utf-8') as f:
++
++        try:
++            with open(HOSTS_PATH, "r", encoding="utf-8") as f:
+                 content = f.read()
+-            
+-            # 移除工具之前添加的内容
++
+             start_idx = content.find(HOSTS_START_MARK)
+             end_idx = content.find(HOSTS_END_MARK)
+-            
++
+             if start_idx != -1 and end_idx != -1:
+-                # 保留标记外的内容
+-                new_content = content[:start_idx] + content[end_idx + len(HOSTS_END_MARK):]
++                new_content = content[:start_idx] + content[end_idx + len(HOSTS_END_MARK) :]
+             else:
+                 new_content = content
+-            
+-            # 添加新的内容
++
+             hosts_entries = [f"{ip} {domain}" for ip, domain in selected_ips]
+-            tool_content = f"\n{HOSTS_START_MARK}\n"
+-            tool_content += "\n".join(hosts_entries)
+-            tool_content += f"\n{HOSTS_END_MARK}\n"
+-            
+-            # 写入新内容
+-            with open(HOSTS_PATH, 'w', encoding='utf-8') as f:
++            tool_content = f"\n{HOSTS_START_MARK}\n" + "\n".join(hosts_entries) + f"\n{HOSTS_END_MARK}\n"
++
++            with open(HOSTS_PATH, "w", encoding="utf-8") as f:
+                 f.write(new_content.rstrip() + tool_content)
+-            
++
+             messagebox.showinfo("成功", f"已成功将 {len(selected_ips)} 条记录写入Hosts文件\n建议刷新DNS使修改生效")
+             self.status_label.config(text="Hosts文件已更新", bootstyle=SUCCESS)
+         except Exception as e:
+-            messagebox.showerror("错误", f"写入Hosts文件失败: {str(e)}")
++            messagebox.showerror("错误", f"写入Hosts文件失败: {e}")
+             self.status_label.config(text="写入Hosts失败", bootstyle=DANGER)
+ 
+     def write_best_ip_to_hosts(self):
+-        """一键写入最优IP（每个域名选择延迟最低的IP）"""
+         if not self.test_results:
+             messagebox.showinfo("提示", "请先进行测速")
+             return
+-            
+-        # 按域名分组，选择每个域名延迟最低的IP
++
+         best_ips = {}
+         for ip, domain, delay, status, _ in self.test_results:
+-            if status == "可用":  # 只考虑可用的IP
+-                if domain not in best_ips or delay < best_ips[domain][1]:
+-                    best_ips[domain] = (ip, delay)
+-        
++            if status != "可用":
++                continue
++            if domain not in best_ips or delay < best_ips[domain][1]:
++                best_ips[domain] = (ip, delay)
++
+         if not best_ips:
+             messagebox.showinfo("提示", "没有可用的IP地址")
+             return
+-            
+-        # 转换为列表
++
+         selected_ips = [(ip, domain) for domain, (ip, _) in best_ips.items()]
+-        
+-        try:
+-            # 读取现有Hosts内容
+-            with open(HOSTS_PATH, 'r', encoding='utf-8') as f:
++
++        try:
++            with open(HOSTS_PATH, "r", encoding="utf-8") as f:
+                 content = f.read()
+-            
+-            # 移除工具之前添加的内容
++
+             start_idx = content.find(HOSTS_START_MARK)
+             end_idx = content.find(HOSTS_END_MARK)
+-            
++
+             if start_idx != -1 and end_idx != -1:
+-                # 保留标记外的内容
+-                new_content = content[:start_idx] + content[end_idx + len(HOSTS_END_MARK):]
++                new_content = content[:start_idx] + content[end_idx + len(HOSTS_END_MARK) :]
+             else:
+                 new_content = content
+-            
+-            # 添加新的内容
++
+             hosts_entries = [f"{ip} {domain}" for ip, domain in selected_ips]
+-            tool_content = f"\n{HOSTS_START_MARK}\n"
+-            tool_content += "\n".join(hosts_entries)
+-            tool_content += f"\n{HOSTS_END_MARK}\n"
+-            
+-            # 写入新内容
+-            with open(HOSTS_PATH, 'w', encoding='utf-8') as f:
++            tool_content = f"\n{HOSTS_START_MARK}\n" + "\n".join(hosts_entries) + f"\n{HOSTS_END_MARK}\n"
++
++            with open(HOSTS_PATH, "w", encoding="utf-8") as f:
+                 f.write(new_content.rstrip() + tool_content)
+-            
++
+             messagebox.showinfo("成功", f"已成功将 {len(selected_ips)} 个最优IP写入Hosts文件\n建议刷新DNS使修改生效")
+             self.status_label.config(text="最优IP已写入Hosts", bootstyle=SUCCESS)
+         except Exception as e:
+-            messagebox.showerror("错误", f"写入Hosts文件失败: {str(e)}")
++            messagebox.showerror("错误", f"写入Hosts文件失败: {e}")
+             self.status_label.config(text="写入Hosts失败", bootstyle=DANGER)
+ 
++    # -------------------------
++    # Utilities
++    # -------------------------
+     def flush_dns(self):
+-        """刷新DNS缓存"""
+         try:
+             self.status_label.config(text="正在刷新DNS缓存...", bootstyle=INFO)
+-            # 执行ipconfig /flushdns命令
+             subprocess.run(
+-                ["ipconfig", "/flushdns"], 
+-                check=True, 
+-                stdout=subprocess.PIPE, 
+-                stderr=subprocess.PIPE, 
+-                text=True
++                ["ipconfig", "/flushdns"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+             )
+             self.status_label.config(text="DNS缓存已刷新", bootstyle=SUCCESS)
+             messagebox.showinfo("成功", "DNS缓存已成功刷新")
+         except Exception as e:
+-            messagebox.showerror("错误", f"刷新DNS缓存失败: {str(e)}")
++            messagebox.showerror("错误", f"刷新DNS缓存失败: {e}")
+             self.status_label.config(text="刷新DNS失败", bootstyle=DANGER)
+ 
+     def view_hosts_file(self):
+-        """查看Hosts文件"""
+-        try:
+-            # 使用记事本打开Hosts文件
++        try:
+             subprocess.run(["notepad.exe", HOSTS_PATH])
+         except Exception as e:
+-            messagebox.showerror("错误", f"无法打开Hosts文件: {str(e)}")
+-
+-
++            messagebox.showerror("错误", f"无法打开Hosts文件: {e}")
++
++
++# ---------------------------------------------------------------------
++# Entry
++# ---------------------------------------------------------------------
+ if __name__ == "__main__":
++    if not is_admin():
++        show_admin_required_and_exit()
++
+     app = ttk.Window(themename="darkly")
+-    app.iconbitmap(os.path.join(base_path, "icon.ico"))  # 设置窗口图标
++    # 图标（不存在就忽略）
++    try:
++        app.iconbitmap(resource_path("icon.ico"))
++    except Exception:
++        pass
++
+     HostsOptimizer(app)
+-    app.mainloop()+    app.mainloop()
+
+--- a/about_gui.py
++++ b/about_gui.py
+@@ -1,227 +1,422 @@
++# -*- coding: utf-8 -*-
++"""
++关于窗口（ttkbootstrap）
++
++改进点：
++1) 使用 ttkbootstrap.Toplevel 而不是创建第二个 Tk/Window + mainloop（避免多窗口/多 mainloop 引发的显示/样式问题）。
++2) 头像加载使用统一的 resource_path，兼容源码运行 & PyInstaller（--onefile/--onedir）。
++3) 头像 PhotoImage 引用保存在窗口对象上，避免被 GC 回收导致“不显示/消失”。
++4) 重新排版：信息区分组、加入分隔线/提示卡片、按钮区更清晰，整体更美观。
++"""
++
++from __future__ import annotations
++
+ import os
+ import sys
++import webbrowser
++from typing import Optional, Sequence
++
+ import ttkbootstrap as ttk
+ from ttkbootstrap.constants import *
+-from tkinter import Label
+-import webbrowser
+-
+-# 获取程序所在目录
+-base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+-
+-# 确保PIL库被正确导入
+-Image = None
+-ImageTk = None
++from ttkbootstrap.scrolled import ScrolledText
++
++# Pillow 用于加载/缩放 jpg；没有 Pillow 时会自动降级为占位符
+ try:
+-    from PIL import Image, ImageTk
+-except ImportError:
+-    pass  # 静默处理，避免干扰用户
++    from PIL import Image, ImageTk, ImageOps, ImageDraw
++except Exception:  # pragma: no cover
++    Image = None
++    ImageTk = None
++    ImageOps = None
++    ImageDraw = None
++
++
++def resource_path(*parts: str) -> str:
++    """
++    返回资源的绝对路径，兼容 PyInstaller 打包与源码运行。
++    - PyInstaller 运行时，资源在 sys._MEIPASS（临时解包目录）里。
++    - 源码运行时，资源相对当前文件所在目录。
++    """
++    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
++    return os.path.join(base_dir, *parts)
++
++
++def find_first_existing(paths: Sequence[str]) -> Optional[str]:
++    for p in paths:
++        if p and os.path.exists(p):
++            return p
++    return None
++
+ 
+ class AboutWindow:
+-    def __init__(self):
++    """
++    关于窗口：作为 Toplevel 弹窗显示（不会再启动第二个 mainloop）
++
++    用法：
++        AboutWindow(master)  # master 为主窗口 Window/Tk
++    """
++
++    def __init__(
++        self,
++        master,
++        *,
++        app_name: str = "智能Hosts测速工具",
++        version: str = "V1.0",
++        author: str = "毕加索自画像",
++        github_profile_url: str = "https://github.com/KenDvD",
++        github_repo_url: str = "https://github.com/KenDvD/SmartHostsTool-github",
++    ) -> None:
++        self.master = master
++        self.app_name = app_name
++        self.version = version
++        self.author = author
++        self.github_profile_url = github_profile_url
++        self.github_repo_url = github_repo_url
++
++        # 窗口尺寸（折叠/展开）
++        self.window_width = 780
++        self.window_height = 470
++        self.expanded_height = 730
++
++        self.usage_expanded = False
++        self.usage_frame = None
++
++        # 创建窗口：用 Toplevel（避免创建第二个 Tk/Window）
++        self.window = ttk.Toplevel(master=master, title=f"关于 {app_name}")
++        self.window.resizable(False, False)
++
++        # 居中显示
+         try:
+-            # 创建主窗口
+-            self.root = ttk.Window(title="关于智能Hosts测速工具", themename="darkly")
+-            self.root.resizable(False, False)
+-            # 增加窗口宽度以显示完整GitHub链接
+-            self.window_width = 750
+-            self.window_height = 450
+-            self.expanded_height = 700  # 展开使用说明时的窗口高度
+-            self.root.geometry("{}x{}+{}+{}".format(
+-                self.window_width,
+-                self.window_height,
+-                int(self.root.winfo_screenwidth() / 2 - self.window_width / 2),
+-                int(self.root.winfo_screenheight() / 2 - self.window_height / 2)
+-            ))
+-            
+-            # 初始化变量
+-            self.usage_expanded = False
+-            self.usage_frame = None
+-            
+-            # 创建界面
+-            self.create_widgets()
+-            
+-            # 运行主循环
+-            self.root.mainloop()
+-        except Exception as e:
+-            import traceback
+-            error_log_path = os.path.join(base_path, "about_error.log")
+-            with open(error_log_path, "w", encoding="utf-8") as f:
+-                f.write(f"初始化错误: {e}\n")
+-                f.write(traceback.format_exc())
+-
+-    def create_widgets(self):
+-        # 设置root的grid布局
+-        self.root.grid_rowconfigure(0, weight=1)
+-        self.root.grid_rowconfigure(1, minsize=80)  # 为按钮区域设置最小高度
+-        self.root.grid_columnconfigure(0, weight=1)
+-        
+-        # 创建主框架
+-        main_frame = ttk.Frame(self.root, padding=20)
+-        main_frame.grid(row=0, column=0, sticky="nsew")
+-        main_frame.grid_rowconfigure(0, weight=1)
+-        main_frame.grid_columnconfigure(1, weight=1)
+-        
+-        # 左侧头像区域
+-        left_frame = ttk.Frame(main_frame)
+-        left_frame.grid(row=0, column=0, sticky="n", padx=(0, 20))
+-        
+-        # 加载头像图片
+-        self.load_avatar(left_frame)
+-        
+-        # 右侧信息区域
+-        right_frame = ttk.Frame(main_frame)
+-        right_frame.grid(row=0, column=1, sticky="nsew")
+-        
+-        # 底部按钮区域
+-        button_frame = ttk.Frame(self.root, padding=(20, 0, 20, 20))
+-        button_frame.grid(row=1, column=0, sticky="ew")
+-        
+-        # 软件名称和版本
+-        name_label = ttk.Label(right_frame, text="智能Hosts测速工具", font= ("微软雅黑", 18, "bold"))
+-        name_label.pack(pady=(0, 5), anchor="w")
+-        
+-        version_label = ttk.Label(right_frame, text="V1.0", font= ("微软雅黑", 12))
+-        version_label.pack(pady=(0, 15), anchor="w")
+-        
+-        # 软件描述
+-        desc_label = ttk.Label(right_frame, text="一个智能获取域名ip进行测试写入hosts文件的工具", 
+-                             font= ("微软雅黑", 10), wraplength=450, justify="left")
+-        desc_label.pack(pady=(0, 20), anchor="w")
+-        
+-        # 作者信息
+-        author_label = ttk.Label(right_frame, text="作者：毕加索自画像", 
+-                               font= ("微软雅黑", 10))
+-        author_label.pack(pady=(0, 5), anchor="w")
+-        
+-        # GitHub链接 - 单独一行显示，确保完整显示
+-        github_link = Label(right_frame, text="github主页：https://github.com/KenDvD", 
+-                          font= ("微软雅黑", 10, "underline"), fg="blue", cursor="hand2")
+-        github_link.pack(pady=(0, 15), anchor="w")
+-        github_link.bind("<Button-1>", lambda e: self.open_github_link())
+-        
+-        # 开源提示（红色警告框）
+-        warning_frame = ttk.Frame(right_frame)
+-        warning_frame.pack(pady=(20, 0), fill=X, anchor="w")
+-        
+-        warning_label = Label(warning_frame, text="该工具完全开源免费！如果你买到此软件那么你被坑了", 
+-                                font= ("微软雅黑", 10, "bold"), foreground="white",
+-                                background="red", wraplength=450, justify="left")
+-        warning_label.pack(fill=X, expand=True, padx=10, pady=10)
+-        
+-        # 详细使用说明按钮 - 使用更明显的样式
+-        usage_btn = ttk.Button(button_frame, text="详细使用说明", 
+-                             command=self.toggle_usage, bootstyle=SUCCESS, width=15)
+-        usage_btn.pack(side=LEFT, padx=(0, 10))
+-        
+-        # 关闭按钮
+-        close_btn = ttk.Button(button_frame, text="确定", 
+-                             command=self.root.destroy, bootstyle=PRIMARY, width=10)
+-        close_btn.pack(side=RIGHT)
+-
+-    def load_avatar(self, parent_frame):
+-        """加载头像图片 - 适配打包环境"""
++            self.window.geometry(f"{self.window_width}x{self.window_height}")
++            self.window.place_window_center()
++        except Exception:
++            # 兼容老版本：手动居中
++            sw = self.window.winfo_screenwidth()
++            sh = self.window.winfo_screenheight()
++            x = int(sw / 2 - self.window_width / 2)
++            y = int(sh / 2 - self.window_height / 2)
++            self.window.geometry(f"{self.window_width}x{self.window_height}+{x}+{y}")
++
++        # 作为模态窗口：阻止用户点到主窗口（可按需去掉）
+         try:
+-            # 尝试多种路径获取方式，确保打包后能找到资源
+-            avatar_path = None
+-            
+-            # 方式1: 直接使用base_path
+-            path1 = os.path.join(base_path, "头像.jpg")
+-            if os.path.exists(path1):
+-                avatar_path = path1
+-            
+-            # 方式2: 检查当前工作目录
+-            if not avatar_path:
+-                path2 = os.path.join(os.getcwd(), "头像.jpg")
+-                if os.path.exists(path2):
+-                    avatar_path = path2
+-            
+-            # 方式3: 检查系统临时目录(针对PyInstaller单文件模式)
+-            if not avatar_path and hasattr(sys, '_MEIPASS'):
+-                path3 = os.path.join(sys._MEIPASS, "头像.jpg")
+-                if os.path.exists(path3):
+-                    avatar_path = path3
+-            
+-            if avatar_path and Image and ImageTk:
+-                image = Image.open(avatar_path)
+-                image = image.resize((150, 150), Image.LANCZOS)
+-                photo = ImageTk.PhotoImage(image)
+-                
+-                # 显示头像
+-                avatar_label = ttk.Label(parent_frame, image=photo)
+-                avatar_label.image = photo  # 保持引用
+-                avatar_label.pack()
++            self.window.transient(master)
++            self.window.grab_set()
++            self.window.focus_set()
++        except Exception:
++            pass
++
++        # 设置图标（如果存在）
++        self._set_icon()
++
++        # 构建 UI
++        self._build_ui()
++
++    # -------------------------
++    # UI
++    # -------------------------
++    def _set_icon(self) -> None:
++        ico = find_first_existing(
++            [
++                resource_path("icon.ico"),
++                resource_path("icon.png"),
++            ]
++        )
++        if not ico:
++            return
++        try:
++            # Windows 下 iconbitmap 最稳定
++            if ico.lower().endswith(".ico"):
++                self.window.iconbitmap(ico)
+             else:
+-                # 加载失败时显示占位符
+-                avatar_label = ttk.Label(parent_frame, text="🤖", font= ("微软雅黑", 80))
+-                avatar_label.pack()
+-                
++                # png 作为 iconphoto
++                if ImageTk and Image:
++                    img = Image.open(ico)
++                    photo = ImageTk.PhotoImage(img)
++                    self.window.iconphoto(False, photo)
++                    # 保存引用，避免被 GC
++                    self.window._icon_photo = photo  # type: ignore[attr-defined]
+         except Exception:
+-            # 加载失败时显示占位符
+-            avatar_label = ttk.Label(parent_frame, text="🤖", font= ("微软雅黑", 80))
+-            avatar_label.pack()
+-
+-    def open_github_link(self):
+-        """打开GitHub链接"""
+-        webbrowser.open("https://github.com/KenDvD")
+-
+-    def toggle_usage(self):
+-        """切换使用说明展开/收起"""
++            pass
++
++    def _build_ui(self) -> None:
++        root = self.window
++        root.grid_rowconfigure(0, weight=1)
++        root.grid_columnconfigure(0, weight=1)
++
++        container = ttk.Frame(root, padding=20)
++        container.grid(row=0, column=0, sticky="nsew")
++        container.grid_columnconfigure(0, weight=0)
++        container.grid_columnconfigure(1, weight=1)
++        container.grid_rowconfigure(2, weight=1)
++
++        # 顶部标题（横跨两列）
++        header = ttk.Frame(container)
++        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
++        header.grid_columnconfigure(0, weight=1)
++
++        title = ttk.Label(
++            header,
++            text=self.app_name,
++            font=("微软雅黑", 18, "bold"),
++            bootstyle="inverse-primary",
++            padding=(12, 10),
++            anchor=W,
++        )
++        title.grid(row=0, column=0, sticky="ew")
++
++        # 内容区域：左头像 / 右信息
++        left = ttk.Frame(container)
++        left.grid(row=1, column=0, sticky="n", padx=(0, 18))
++
++        right = ttk.Frame(container)
++        right.grid(row=1, column=1, sticky="nsew")
++        right.grid_columnconfigure(0, weight=1)
++
++        # 头像卡片
++        avatar_card = ttk.Labelframe(left, text="头像", padding=(12, 10))
++        avatar_card.grid(row=0, column=0, sticky="n")
++        self._render_avatar(avatar_card)
++
++        # 右侧信息（分组卡片）
++        info_card = ttk.Labelframe(right, text="项目信息", padding=(14, 12))
++        info_card.grid(row=0, column=0, sticky="ew")
++        info_card.grid_columnconfigure(0, weight=1)
++
++        ttk.Label(
++            info_card,
++            text=f"版本：{self.version}",
++            font=("微软雅黑", 11),
++        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
++
++        ttk.Label(
++            info_card,
++            text="简介：一个智能获取域名 IP 进行测试并写入 hosts 的工具",
++            font=("微软雅黑", 10),
++            wraplength=520,
++            justify=LEFT,
++        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
++
++        ttk.Separator(info_card).grid(row=2, column=0, sticky="ew", pady=(4, 10))
++
++        ttk.Label(
++            info_card,
++            text=f"作者：{self.author}",
++            font=("微软雅黑", 10),
++        ).grid(row=3, column=0, sticky="w", pady=(0, 6))
++
++        # GitHub 链接（用 Label 做超链接效果）
++        link_line = ttk.Frame(info_card)
++        link_line.grid(row=4, column=0, sticky="ew")
++        link_line.grid_columnconfigure(1, weight=1)
++
++        ttk.Label(link_line, text="GitHub：", font=("微软雅黑", 10)).grid(
++            row=0, column=0, sticky="w"
++        )
++        link = ttk.Label(
++            link_line,
++            text="KenDvD / SmartHostsTool-github",
++            font=("微软雅黑", 10, "underline"),
++            cursor="hand2",
++            bootstyle="info",
++        )
++        link.grid(row=0, column=1, sticky="w")
++        link.bind("<Button-1>", lambda _e: self.open_repo())
++
++        # 开源提示卡片
++        warn = ttk.Label(
++            right,
++            text="该工具完全开源免费！如果你买到此软件那么你被坑了",
++            font=("微软雅黑", 10, "bold"),
++            wraplength=520,
++            justify=LEFT,
++            bootstyle="inverse-danger",
++            padding=(12, 10),
++        )
++        warn.grid(row=1, column=0, sticky="ew", pady=(12, 0))
++
++        # 使用说明（可展开）
++        self.usage_container = ttk.Frame(container)
++        self.usage_container.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
++        self.usage_container.grid_columnconfigure(0, weight=1)
++        self.usage_container.grid_rowconfigure(0, weight=1)
++
++        # 底部按钮栏
++        btnbar = ttk.Frame(container)
++        btnbar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
++        btnbar.grid_columnconfigure(0, weight=1)
++
++        left_btns = ttk.Frame(btnbar)
++        left_btns.grid(row=0, column=0, sticky="w")
++
++        right_btns = ttk.Frame(btnbar)
++        right_btns.grid(row=0, column=1, sticky="e")
++
++        self.usage_btn = ttk.Button(
++            left_btns,
++            text="展开使用说明",
++            command=self.toggle_usage,
++            bootstyle="success",
++            width=14,
++        )
++        self.usage_btn.pack(side=LEFT)
++
++        ttk.Button(
++            left_btns,
++            text="打开 GitHub",
++            command=self.open_repo,
++            bootstyle="info-outline",
++            width=12,
++        ).pack(side=LEFT, padx=(10, 0))
++
++        ttk.Button(
++            right_btns,
++            text="确定",
++            command=self.close,
++            bootstyle="primary",
++            width=10,
++        ).pack(side=RIGHT)
++
++        # ESC 关闭
++        root.bind("<Escape>", lambda _e: self.close())
++
++    # -------------------------
++    # Avatar
++    # -------------------------
++    def _render_avatar(self, parent) -> None:
++        """
++        渲染头像。优先加载项目目录里的头像文件；失败则显示占位符。
++        """
++        # 尽量兼容你仓库里的资源命名（头像.jpg / 头线.jpg / avatar.png 等）
++        candidate_names = [
++            "头像.jpg",
++            "头像.jpeg",
++            "头像.png",
++            "头线.jpg",
++            "头线.png",
++            "avatar.jpg",
++            "avatar.png",
++        ]
++        candidate_paths = []
++
++        # 1) 根目录
++        for name in candidate_names:
++            candidate_paths.append(resource_path(name))
++
++        # 2) 常见资源目录
++        for folder in ("assets", "res", "resources", "img", "images"):
++            for name in candidate_names:
++                candidate_paths.append(resource_path(folder, name))
++
++        avatar_path = find_first_existing(candidate_paths)
++
++        # 没有 Pillow / 没找到头像文件：占位符
++        if not (avatar_path and Image and ImageTk and ImageOps and ImageDraw):
++            ttk.Label(parent, text="🤖", font=("微软雅黑", 80), padding=(10, 6)).pack()
++            ttk.Label(parent, text="(未找到头像资源)", font=("微软雅黑", 9)).pack(pady=(6, 0))
++            return
++
++        try:
++            # 读取并裁剪成圆形头像（更好看）
++            size = 160
++            img = Image.open(avatar_path).convert("RGBA")
++            img = ImageOps.fit(img, (size, size), method=Image.LANCZOS)
++
++            # 圆形蒙版
++            mask = Image.new("L", (size, size), 0)
++            draw = ImageDraw.Draw(mask)
++            draw.ellipse((0, 0, size, size), fill=255)
++
++            out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
++            out.paste(img, (0, 0), mask=mask)
++
++            photo = ImageTk.PhotoImage(out)
++
++            lbl = ttk.Label(parent, image=photo)
++            lbl.pack()
++
++            # 关键：保存引用，避免 PhotoImage 被 GC 回收导致“头像不显示”
++            self.window._avatar_photo = photo  # type: ignore[attr-defined]
++            self.window._avatar_label = lbl  # type: ignore[attr-defined]
++        except Exception:
++            ttk.Label(parent, text="🤖", font=("微软雅黑", 80), padding=(10, 6)).pack()
++            ttk.Label(parent, text="(头像加载失败)", font=("微软雅黑", 9)).pack(pady=(6, 0))
++
++    # -------------------------
++    # Actions
++    # -------------------------
++    def open_repo(self) -> None:
++        webbrowser.open(self.github_repo_url)
++
++    def open_profile(self) -> None:
++        webbrowser.open(self.github_profile_url)
++
++    def close(self) -> None:
++        try:
++            self.window.grab_release()
++        except Exception:
++            pass
++        self.window.destroy()
++
++    def toggle_usage(self) -> None:
+         if not self.usage_expanded:
+-            # 创建使用说明框架
+             if self.usage_frame is None:
+-                # 获取右侧信息框架
+-                main_frame = self.root.winfo_children()[0]  # main_frame是root的第一个子组件
+-                right_frame = main_frame.winfo_children()[1]  # right_frame是main_frame的第二个子组件
+-                
+-                self.usage_frame = ttk.LabelFrame(right_frame, text="软件详细使用说明", 
+-                                                padding=20)
+-                self.usage_frame.pack(fill=X, padx=0, pady=(10, 0), anchor="w")
+-                
+-                # 使用说明内容
++                self.usage_frame = ttk.Labelframe(
++                    self.usage_container, text="软件详细使用说明", padding=12
++                )
++                self.usage_frame.grid(row=0, column=0, sticky="nsew")
++                self.usage_container.grid_rowconfigure(0, weight=1)
++
+                 usage_content = """
+ 软件详细使用说明：
+ 
+-1. 首先以管理员身份打开软件，点击--自定义网站预设--选择你需要测速的域名（可以自己添加自己想要的域名）
+-
+-2. 例如github这个网址单击选择后，点击智能解析ip也可以再点击刷新远程Hosts可以获取更多IP
+-   （刷新远程hosts是github专属的，其他域名均是智能解析IP后测速。）
+-
+-3. 点击开始测速---选择延迟低的ip写入你的hosts，也可以点击一键添加延迟最低的IP
+-
+----其他功能---
+-
+-1. 刷新DNS：清除DNS缓存，使Hosts文件的修改立即生效
+-
+-2. 查看hosts文件：以默认编辑器打开系统Hosts文件
+-
+-3. 添加/删除预设：管理自定义的域名列表，方便下次使用
+-
+-4. 手动选择IP：可以根据实际需求选择特定IP写入Hosts文件
+-
+-5. 自动排序：测速完成后，结果会按延迟时间自动排序，方便选择最优IP
+-                """
+-                
+-                # 使用ScrolledText组件实现滚动功能
+-                from ttkbootstrap.scrolled import ScrolledText
+-                usage_text = ScrolledText(self.usage_frame, wrap=WORD, font=("微软雅黑", 10), height=15)
+-                usage_text.insert("1.0", usage_content.strip())
+-                usage_text.config(state="disabled")  # 设置为只读
+-                usage_text.pack(fill=X, anchor="w")
++1. 首先以管理员身份打开软件，点击「自定义网站预设」选择你需要测速的域名（可以自己添加想要的域名）
++
++2. 例如 github.com：选择后点击「智能解析IP」，也可以再点击「刷新远程 Hosts」获取更多 IP
++   （刷新远程 Hosts 仅 GitHub 专属，其他域名均为智能解析后测速。）
++
++3. 点击「开始测速」——选择延迟低的 IP 写入 hosts；也可以点「一键写入最优IP」
++
++--- 其他功能 ---
++
++1. 刷新 DNS：清除 DNS 缓存，使 hosts 修改立即生效
++2. 查看 hosts 文件：用系统默认编辑器打开系统 hosts 文件
++3. 添加/删除预设：管理自定义域名列表，方便下次使用
++4. 手动选择IP：按实际需求选择特定 IP 写入 hosts
++5. 自动排序：测速完成后结果按延迟自动排序，方便选择最优 IP
++                """.strip()
++
++                text = ScrolledText(
++                    self.usage_frame, wrap=WORD, font=("微软雅黑", 10), height=12
++                )
++                text.insert("1.0", usage_content)
++                text.configure(state="disabled")
++                text.pack(fill=BOTH, expand=True)
++
+             else:
+-                self.usage_frame.pack(fill=X, padx=0, pady=(10, 0), anchor="w")
+-            
++                self.usage_frame.grid(row=0, column=0, sticky="nsew")
++
+             self.usage_expanded = True
+-            # 调整窗口大小以适应内容
+-            self.root.geometry("{}x{}".format(self.window_width, self.expanded_height))
++            self.usage_btn.configure(text="收起使用说明")
++            self.window.geometry(f"{self.window_width}x{self.expanded_height}")
++            try:
++                self.window.place_window_center()
++            except Exception:
++                pass
+         else:
+-            # 隐藏使用说明
+             if self.usage_frame:
+-                self.usage_frame.pack_forget()
+-            
++                self.usage_frame.grid_remove()
++
+             self.usage_expanded = False
+-            # 恢复窗口原始大小
+-            self.root.geometry("{}x{}".format(self.window_width, self.window_height))
++            self.usage_btn.configure(text="展开使用说明")
++            self.window.geometry(f"{self.window_width}x{self.window_height}")
++            try:
++                self.window.place_window_center()
++            except Exception:
++                pass
++
+ 
+ if __name__ == "__main__":
+-    # 直接运行，不需要管理员权限检查
+-    AboutWindow()+    # 允许单独运行预览（不会影响主程序）
++    app = ttk.Window(themename="darkly")
++    app.withdraw()
++    AboutWindow(app)
++    app.mainloop()
