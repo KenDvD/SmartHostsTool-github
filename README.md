@@ -2,7 +2,7 @@
 
 **SmartHostsTool** 是一款用于 **域名 IP 智能测速与 Hosts 优化写入** 的工具，通过自动测速算法筛选最优 IP 并写入系统 Hosts 文件，帮助用户解决访问速度慢、解析不稳定等问题 🛠️。
 
-> ℹ️ 本程序的 **远程 Hosts 文件来自 `https://github.com/521xueweihan/GitHub520` 仓库**（用于获取最新 GitHub 相关域名的 IP 列表）。该仓库通过定期更新的 hosts 解析数据帮助提升访问速度和稳定性。:contentReference[oaicite:0]{index=0}
+> ℹ️ 本程序的 **远程 Hosts 文件来自 `https://github.com/521xueweihan/GitHub520` 仓库**（用于获取最新 GitHub 相关域名的 IP 列表）。该仓库通过定期更新的 hosts 解析数据帮助提升访问速度和稳定性。
 
 ---
 
