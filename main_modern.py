@@ -19,6 +19,7 @@ import ctypes
 import json
 import os
 import re
+import ipaddress
 import socket
 import subprocess
 import sys
@@ -26,10 +27,13 @@ import threading
 from datetime import datetime
 from typing import List, Tuple, Optional
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import requests
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, StringVar, Menu
 
 from about_gui_modern import AboutWindow
 
@@ -57,7 +61,36 @@ def resource_path(*parts: str) -> str:
 # ---------------------------------------------------------------------
 APP_THEME = "vapor"  # 可选：darkly / superhero / cyborg / flatly ...
 GITHUB_TARGET_DOMAIN = "github.com"
-REMOTE_HOSTS_URL = "https://github-hosts.tinsfox.com/hosts"
+# 远程 hosts 多源列表（按优先级轮询）
+REMOTE_HOSTS_URLS = [
+    # 你原来使用的站点（保留为高优先级）
+    "https://github-hosts.tinsfox.com/hosts",
+    # GitHub520 官方推荐
+    "https://raw.hellogithub.com/hosts",
+    # GitHub520 - GitHub Raw（直连）
+    "https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts",
+    # GitHub520 - jsDelivr CDN（部分网络更稳）
+    "https://fastly.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts",
+    "https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts",
+    # GitHub Raw 加速代理（可选备用）
+    "https://ghproxy.com/https://raw.githubusercontent.com/521xueweihan/GitHub520/main/hosts",
+    # ineo6/hosts GitLab 镜像备用
+    "https://gitlab.com/ineo6/hosts/-/raw/master/hosts",
+]
+
+# 远程 Hosts 源选择（用于 UI 下拉框）：(显示名, URL/None)
+REMOTE_HOSTS_SOURCE_CHOICES = [
+    ("自动（按优先级）", None),
+    ("tinsfox（github-hosts.tinsfox.com）", REMOTE_HOSTS_URLS[0]),
+    ("GitHub520（raw.hellogithub.com）", REMOTE_HOSTS_URLS[1]),
+    ("GitHub520（raw.githubusercontent.com）", REMOTE_HOSTS_URLS[2]),
+    ("GitHub520 CDN（fastly.jsdelivr.net）", REMOTE_HOSTS_URLS[3]),
+    ("GitHub520 CDN（cdn.jsdelivr.net）", REMOTE_HOSTS_URLS[4]),
+    ("GitHub Raw 代理（ghproxy.com）", REMOTE_HOSTS_URLS[5]),
+    ("ineo6 镜像（gitlab.com）", REMOTE_HOSTS_URLS[6]),
+]
+# 超时： (连接超时, 读取超时)
+REMOTE_FETCH_TIMEOUT = (5, 15)
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 HOSTS_START_MARK = "# === SmartHostsTool Start ==="
 HOSTS_END_MARK = "# === SmartHostsTool End ==="
@@ -180,6 +213,13 @@ class HostsOptimizer(ttk.Frame):
         self.master = master
         print(f"父类初始化完成，master: {master}")
 
+        # 用于获取远程 hosts 的复用 Session（带重试/连接池）
+        self._http = self._build_http_session()
+        self.remote_hosts_source_url: Optional[str] = None
+
+
+        # 远程源选择：None 表示自动按优先级轮询；否则固定使用某个 URL
+        self.remote_source_url_override: Optional[str] = None
         self.master.title("智能 Hosts 测速工具")
         print("设置窗口标题成功")
         self.master.geometry("1080x680")
@@ -285,6 +325,31 @@ class HostsOptimizer(ttk.Frame):
 
             self.about_btn = ttk.Button(actions, text="关于", command=self.show_about, bootstyle=INFO, width=8)
             self.about_btn.pack(side=LEFT, padx=5)
+
+            # 远程源选择（下拉菜单按钮，仅影响「刷新远程 Hosts」）
+            self.remote_source_var = StringVar(value=REMOTE_HOSTS_SOURCE_CHOICES[0][0])
+            self.remote_source_btn_text = StringVar()
+            self.remote_source_btn_text.set(self._format_remote_source_button_text(self.remote_source_var.get()))
+
+            self.remote_source_btn = ttk.Menubutton(
+                actions,
+                textvariable=self.remote_source_btn_text,
+                bootstyle="secondary",
+                width=15,
+            )
+            self.remote_source_btn.pack(side=LEFT, padx=(12, 8))
+
+            self.remote_source_menu = Menu(self.remote_source_btn, tearoff=0)
+            for label, _url in REMOTE_HOSTS_SOURCE_CHOICES:
+                self.remote_source_menu.add_radiobutton(
+                    label=label,
+                    variable=self.remote_source_var,
+                    value=label,
+                    command=self.on_remote_source_change,
+                )
+            self.remote_source_btn["menu"] = self.remote_source_menu
+
+
 
             self.refresh_remote_btn = ttk.Button(
                 actions,
@@ -457,6 +522,65 @@ class HostsOptimizer(ttk.Frame):
             pass
         self._about = AboutWindow(self.master)
 
+
+    # -------------------------
+    # Remote source selector (UI)
+    # -------------------------
+    
+    def _format_remote_source_button_text(self, choice_label: str) -> str:
+        """把远程源选择显示成更紧凑的按钮文本。"""
+        label = (choice_label or "").strip()
+        # 按钮上尽量短一点，菜单里仍保留完整描述
+        if len(label) > 16:
+            label = label[:15] + "…"
+        return f"远程源：{label} ▾"
+
+    def _toast(self, title: str, message: str, *, bootstyle: str = "info", duration: int = 1800):
+        """轻量提示：优先用 ttkbootstrap 的 ToastNotification；不可用则静默跳过。"""
+        try:
+            from ttkbootstrap.toast import ToastNotification  # ttkbootstrap 官方 toast 模块
+            ToastNotification(
+                title=title,
+                message=message,
+                duration=duration,
+                bootstyle=bootstyle,
+            ).show_toast()
+        except Exception:
+            # 不影响主流程
+            pass
+
+    def on_remote_source_change(self, _event=None):
+        """远程 Hosts 源下拉选择变化。"""
+        choice = None
+        try:
+            choice = self.remote_source_var.get()
+        except Exception:
+            return
+
+        # 同步更新按钮显示
+        try:
+            self.remote_source_btn_text.set(self._format_remote_source_button_text(choice))
+        except Exception:
+            pass
+
+        mapping = {label: url for (label, url) in REMOTE_HOSTS_SOURCE_CHOICES}
+        self.remote_source_url_override = mapping.get(choice)
+
+        # 轻提示：不打断用户操作
+        if self.remote_source_url_override:
+            self.status_label.config(text=f"已选择远程源：{choice}", bootstyle=INFO)
+        else:
+            self.status_label.config(text="已选择远程源：自动（按优先级）", bootstyle=INFO)
+
+
+    def _stop_progress_indeterminate_safe(self):
+        """线程回调中安全停止 indeterminate 进度条动画。"""
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+        except Exception:
+            pass
+
     # -------------------------
     # Presets
     # -------------------------
@@ -603,6 +727,95 @@ class HostsOptimizer(ttk.Frame):
             import traceback
             traceback.print_exc()
 
+
+    # -------------------------
+    # Remote hosts - 网络与校验（更稳）
+    # -------------------------
+    def _build_http_session(self) -> requests.Session:
+        """构造一个带重试/连接池的 Session，用于远程 hosts 获取。"""
+        s = requests.Session()
+        s.headers.update(
+            {
+                "User-Agent": "SmartHostsTool/Modern (+https://github.com/KenDvD/SmartHostsTool-github)",
+                "Accept": "text/plain, */*",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
+        )
+
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.6,  # 指数退避
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        return s
+
+    def _looks_like_hosts(self, text: str) -> bool:
+        """粗略判断返回内容是否像 hosts（避免拿到 HTML/错误页）。"""
+        head = (text or "")[:400].lower()
+        if "<html" in head or "<!doctype" in head:
+            return False
+
+        # 常见标记（GitHub520/ineo6）
+        if "github520 host start" in head or "github host start" in head or "github hosts" in head:
+            return True
+
+        good = 0
+        for line in (text or "").splitlines()[:400]:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 2:
+                continue
+            ip, host = parts[0], parts[1]
+            try:
+                ipaddress.ip_address(ip)
+            except Exception:
+                continue
+            if "." in host:
+                good += 1
+            if good >= 8:
+                return True
+        return False
+
+    def _download_remote_hosts_text(self) -> tuple[str, str]:
+        """获取远程 hosts 文本，返回 (text, used_url)。
+
+        - 若用户在 UI 中选择了固定远程源，则仅请求该 URL；
+        - 否则按 REMOTE_HOSTS_URLS 优先级轮询，任一源成功即返回。
+        """
+        errors: List[str] = []
+
+        url_list = [self.remote_source_url_override] if self.remote_source_url_override else list(REMOTE_HOSTS_URLS)
+
+        for url in url_list:
+            try:
+                resp = self._http.get(url, timeout=REMOTE_FETCH_TIMEOUT, allow_redirects=True)
+                resp.raise_for_status()
+
+                # 尽量使用响应编码；不行则 fallback
+                if not resp.encoding:
+                    resp.encoding = "utf-8"
+                text = resp.text
+
+                if not self._looks_like_hosts(text):
+                    raise ValueError("内容校验失败：返回内容不像 hosts（可能被劫持/返回 HTML/错误页）")
+
+                return text, url
+            except Exception as e:
+                errors.append(f"{url} -> {type(e).__name__}: {e}")
+
+        raise RuntimeError("所有远程 hosts 源均获取失败：\n" + "\n".join(errors))
+
+
     # -------------------------
     # Remote hosts (GitHub only)
     # -------------------------
@@ -610,43 +823,72 @@ class HostsOptimizer(ttk.Frame):
         if not self.is_github_selected:
             return
 
-        self.status_label.config(text="正在刷新远程Hosts...", bootstyle=INFO)
+        # 远程获取时长不可预测：用 indeterminate 动画反馈“仍在工作”
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(10)
+        except Exception:
+            pass
+
+        choice = None
+        try:
+            choice = self.remote_source_var.get()
+        except Exception:
+            choice = "自动（按优先级）"
+
+        self.status_label.config(text=f"正在刷新远程Hosts…（源：{choice}）", bootstyle=INFO)
         self.refresh_remote_btn.config(state=DISABLED)
         threading.Thread(target=self._fetch_remote_hosts, daemon=True).start()
 
     def _fetch_remote_hosts(self):
         try:
-            resp = requests.get(REMOTE_HOSTS_URL, timeout=10)
-            resp.raise_for_status()
+            hosts_content, used_url = self._download_remote_hosts_text()
 
-            hosts_content = resp.text
-            lines = hosts_content.splitlines()
+            self.remote_hosts_source_url = used_url
+
+            # 兼容“按行 hosts”以及“单行+空格分隔多条记录”的 hosts 文本
+            # 直接在全文里提取 (IP, Domain) 对，避免被注释/换行格式影响。
+            pairs = re.findall(
+                r'((?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]{2,})\s+([A-Za-z0-9.-]+)',
+                hosts_content,
+            )
 
             self.remote_hosts_data = []
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#"):
+            for ip, domain in pairs:
+                try:
+                    ipaddress.ip_address(ip)
+                except Exception:
                     continue
-                parts = re.split(r"\s+", line)
-                if len(parts) >= 2:
-                    ip, domain = parts[0], parts[1]
-                    if "github" in domain:
-                        self.remote_hosts_data.append((ip, domain))
+                if "github" in domain.lower():
+                    self.remote_hosts_data.append((ip, domain))
 
             self.master.after(0, self._update_remote_hosts_ui)
         except Exception as e:
-            self.master.after(0, lambda err=e: messagebox.showerror("获取失败", f"无法获取远程Hosts: {err}"))
+            self.master.after(0, lambda: self._stop_progress_indeterminate_safe())
+            self.master.after(0, lambda err=e: messagebox.showerror("获取失败", f"无法获取远程Hosts:\n{err}"))
+            self.master.after(0, lambda: self._toast("远程 Hosts", "获取失败：已尝试备用源（详见弹窗）", bootstyle="danger", duration=2600))
             self.master.after(0, lambda: self.status_label.config(text="远程Hosts获取失败", bootstyle=DANGER))
             self.master.after(0, lambda: self.refresh_remote_btn.config(state=NORMAL))
 
     def _update_remote_hosts_ui(self):
+        # 结束远程获取动画
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress.configure(value=0)
+        except Exception:
+            pass
+
         for item in self.remote_tree.get_children():
             self.remote_tree.delete(item)
 
         for ip, domain in self.remote_hosts_data:
             self.remote_tree.insert("", "end", values=[ip, domain])
 
-        self.status_label.config(text=f"远程Hosts刷新完成，共找到 {len(self.remote_hosts_data)} 条记录", bootstyle=SUCCESS)
+        source = f"（来源：{self.remote_hosts_source_url}）" if getattr(self, "remote_hosts_source_url", None) else ""
+        self.status_label.config(text=f"远程Hosts刷新完成，共找到 {len(self.remote_hosts_data)} 条记录{source}", bootstyle=SUCCESS)
+        self._toast("远程 Hosts", f"刷新完成：{len(self.remote_hosts_data)} 条（{self.remote_source_var.get()}）", bootstyle="success", duration=2200)
         self.refresh_remote_btn.config(state=NORMAL)
         self.start_test_btn.config(state=NORMAL)
 
@@ -674,11 +916,18 @@ class HostsOptimizer(ttk.Frame):
         self.refresh_remote_btn.config(state=DISABLED)
         self.stop_test = False
 
-        self.progress["value"] = 0
+        # 已知总量：用 determinate 百分比
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress.configure(value=0, maximum=100)
+        except Exception:
+            self.progress["value"] = 0
+
         self.total_tests = len(test_data)
         self.completed_tests = 0
 
-        self.status_label.config(text="正在测速，请稍候...", bootstyle=INFO)
+        self.status_label.config(text=f"正在测速… 0/{self.total_tests}", bootstyle=INFO)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
         for ip, domain in test_data:
@@ -714,7 +963,13 @@ class HostsOptimizer(ttk.Frame):
 
         self.completed_tests += 1
         progress = (self.completed_tests / self.total_tests) * 100
-        self.progress.configure(value=progress)
+        try:
+            self.progress.configure(value=progress)
+        except Exception:
+            self.progress["value"] = progress
+
+        # 状态栏实时反馈
+        self.status_label.config(text=f"测速中… {self.completed_tests}/{self.total_tests}", bootstyle=INFO)
 
         self._sort_test_results()
 

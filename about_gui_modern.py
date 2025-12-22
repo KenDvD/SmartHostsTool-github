@@ -7,6 +7,11 @@
 - 保持原有功能：打开 GitHub、展开/收起使用说明、资源路径兼容 PyInstaller
 - 仍使用 Toplevel（避免第二个 Tk/mainloop）
 
+优化内容：
+- 修复了展开/收起使用说明的UI显示问题
+- 添加了强制UI刷新机制
+- 优化了窗口大小调整的流畅度
+
 依赖：
 - ttkbootstrap（必需）
 - Pillow（可选，用于更漂亮的渐变背景/头像圆形裁剪；无 Pillow 则自动降级）
@@ -48,10 +53,10 @@ def find_first_existing(paths: Sequence[str]) -> Optional[str]:
 
 class _GlassBackground:
     """
-    为窗口提供“玻璃质感”的背景（渐变 + 柔和噪点）。
+    为窗口提供"玻璃质感"的背景（渐变 + 柔和噪点）。
     Tk/ttk 本身不支持真正的局部磨砂模糊，这里用视觉拟态实现：
     - 生成一张渐变背景图，铺到 Canvas；
-    - 组件使用“卡片”风格（边框/阴影拟态）叠在上方。
+    - 组件使用"卡片"风格（边框/阴影拟态）叠在上方。
     """
 
     def __init__(self, master: ttk.Toplevel):
@@ -146,7 +151,7 @@ class AboutWindow:
         master,
         *,
         app_name: str = "智能Hosts测速工具",
-        version: str = "V1.2",
+        version: str = "V1.4",
         author: str = "毕加索自画像",
         github_profile_url: str = "https://github.com/KenDvD",
         github_repo_url: str = "https://github.com/KenDvD/SmartHostsTool-github",
@@ -226,7 +231,7 @@ class AboutWindow:
     def _build_ui(self) -> None:
         root = self.window
 
-        # Style tweaks (更“卡片”)
+        # Style tweaks (更"卡片")
         style = ttk.Style()
         try:
             style.configure("Card.TFrame", background=style.colors.bg)
@@ -238,7 +243,7 @@ class AboutWindow:
         container = ttk.Frame(root, padding=18)
         container.pack(fill=BOTH, expand=True)
 
-        # 顶部“应用栏”
+        # 顶部"应用栏"
         appbar = ttk.Frame(container)
         appbar.pack(fill=X)
 
@@ -322,7 +327,7 @@ class AboutWindow:
         self.usage_container = ttk.Frame(container)
         self.usage_container.pack(fill=BOTH, expand=True, pady=(14, 0))
 
-        # 底部按钮栏（更现代的“动作区”）
+        # 底部按钮栏（更现代的"动作区"）
         btnbar = ttk.Frame(container)
         btnbar.pack(fill=X, pady=(12, 0))
 
@@ -418,7 +423,12 @@ class AboutWindow:
         self.window.destroy()
 
     def toggle_usage(self) -> None:
+        """
+        展开/收起使用说明
+        优化版本：添加了UI强制刷新机制，确保界面正确更新
+        """
         if not self.usage_expanded:
+            # === 展开使用说明 ===
             if self.usage_frame is None:
                 self.usage_frame = ttk.Labelframe(
                     self.usage_container, text="软件详细使用说明", padding=14
@@ -461,24 +471,55 @@ class AboutWindow:
                 text.pack(side=LEFT, fill=BOTH, expand=True, padx=2, pady=2)
                 scrollbar.configure(command=text.yview)
 
+            # 显示使用说明框架
             self.usage_frame.pack(fill=BOTH, expand=True)
+            
+            # 更新状态
             self.usage_expanded = True
             self.usage_btn.configure(text="收起使用说明")
+            
+            # 调整窗口大小
             self.window.geometry(f"{self.window_width}x{self.expanded_height}")
+            
+            # 强制刷新UI - 关键修复！
+            self.window.update_idletasks()
+            
+            # 重新居中窗口
             try:
                 self.window.place_window_center()
             except Exception:
-                pass
+                # 如果place_window_center不可用，手动居中
+                sw = self.window.winfo_screenwidth()
+                sh = self.window.winfo_screenheight()
+                x = int(sw / 2 - self.window_width / 2)
+                y = int(sh / 2 - self.expanded_height / 2)
+                self.window.geometry(f"{self.window_width}x{self.expanded_height}+{x}+{y}")
         else:
+            # === 收起使用说明 ===
             if self.usage_frame:
+                # 隐藏使用说明框架
                 self.usage_frame.pack_forget()
+            
+            # 更新状态
             self.usage_expanded = False
             self.usage_btn.configure(text="展开使用说明")
+            
+            # 调整窗口大小回到原始尺寸
             self.window.geometry(f"{self.window_width}x{self.window_height}")
+            
+            # 强制刷新UI - 关键修复！
+            self.window.update_idletasks()
+            
+            # 重新居中窗口
             try:
                 self.window.place_window_center()
             except Exception:
-                pass
+                # 如果place_window_center不可用，手动居中
+                sw = self.window.winfo_screenwidth()
+                sh = self.window.winfo_screenheight()
+                x = int(sw / 2 - self.window_width / 2)
+                y = int(sh / 2 - self.window_height / 2)
+                self.window.geometry(f"{self.window_width}x{self.window_height}+{x}+{y}")
 
 
 if __name__ == "__main__":
