@@ -40,6 +40,12 @@ try:
 except Exception:
     Image = None; ImageTk = None; ImageDraw = None; ImageFilter = None
 
+# Toast通知 可选
+try:
+    from ttkbootstrap.toast import ToastNotification
+except ImportError:
+    ToastNotification = None
+
 # ---------------------------------------------------------------------
 # 资源路径
 # ---------------------------------------------------------------------
@@ -468,18 +474,19 @@ class HostsOptimizer(ttk.Frame):
     # 逻辑部分
     # -------------------------
     
-    # 恢复原版 Toast 弹窗方法
+    # Toast 弹窗方法
     def _toast(self, title: str, message: str, *, bootstyle: str = "info", duration: int = 1800):
         try:
-            from ttkbootstrap.toast import ToastNotification
-            ToastNotification(
-                title=title,
-                message=message,
-                duration=duration,
-                bootstyle=bootstyle,
-            ).show_toast()
-        except Exception:
-            pass
+            if ToastNotification:
+                ToastNotification(
+                    title=title,
+                    message=message,
+                    duration=duration,
+                    bootstyle=bootstyle,
+                ).show_toast()
+        except Exception as e:
+            # 可以选择记录错误日志
+            print(f"Toast通知显示失败: {e}")
 
     def _format_remote_source_button_text(self, choice_label: str) -> str:
         # 这里是唯一简化的地方：按钮上文字过长时截断
@@ -494,8 +501,10 @@ class HostsOptimizer(ttk.Frame):
         self.remote_source_url_override = mp.get(c)
         if self.remote_source_url_override:
             self.status_label.config(text=f"已选择远程源：{c}", bootstyle=INFO)
+            self._toast("数据源切换", f"已切换到：{c}", bootstyle="info", duration=1800)
         else:
             self.status_label.config(text="已选择远程源：自动（按优先级）", bootstyle=INFO)
+            self._toast("数据源切换", "已切换到：自动（按优先级）", bootstyle="info", duration=1800)
 
     def show_about(self):
         if AboutWindow: 
@@ -689,6 +698,7 @@ class HostsOptimizer(ttk.Frame):
         self.stop_test = True
         self._stop_event.set()
         self.status_label.config(text="正在停止测速...", bootstyle=WARNING)
+        self._toast("测速暂停", "已暂停当前测速任务", bootstyle="warning", duration=2000)
 
     def on_tree_click(self, event):
         if self.result_tree.identify_column(event.x) != "#1": return
@@ -720,6 +730,10 @@ class HostsOptimizer(ttk.Frame):
 
     def _do_write(self, lst):
         try:
+            if not is_admin():
+                self._toast("权限不足", "写入Hosts文件需要管理员权限，请以管理员身份运行程序", bootstyle="warning", duration=3000)
+                messagebox.showerror("权限不足", "写入Hosts文件需要管理员权限，请以管理员身份运行程序")
+                return
             with open(HOSTS_PATH, "r", encoding="utf-8") as f: c = f.read()
             s, e = c.find(HOSTS_START_MARK), c.find(HOSTS_END_MARK)
             new_c = (c[:s] + (c[e+len(HOSTS_END_MARK):] if e!=-1 else "")) if s!=-1 else c
@@ -728,7 +742,12 @@ class HostsOptimizer(ttk.Frame):
             self.flush_dns(silent=True)
             messagebox.showinfo("成功", f"已成功将 {len(lst)} 条记录写入Hosts文件\n建议刷新DNS使修改生效")
             self.status_label.config(text="Hosts文件已更新", bootstyle=SUCCESS)
-        except Exception as e: messagebox.showerror("错误", f"写入Hosts文件失败: {e}")
+        except Exception as e:
+            if "permission denied" in str(e).lower() or "拒绝访问" in str(e):
+                self._toast("权限不足", "写入Hosts文件需要管理员权限，请以管理员身份运行程序", bootstyle="warning", duration=3000)
+                messagebox.showerror("权限不足", f"写入Hosts文件失败: {e}\n请以管理员身份运行程序")
+            else:
+                messagebox.showerror("错误", f"写入Hosts文件失败: {e}")
 
     def flush_dns(self, silent=False):
         """刷新DNS缓存"""
@@ -740,6 +759,9 @@ class HostsOptimizer(ttk.Frame):
             if not silent: 
                 messagebox.showinfo("成功", "DNS缓存已成功刷新")
                 self.status_label.config(text="DNS缓存已刷新", bootstyle=SUCCESS)
+            else:
+                # 静默模式下显示Toast通知
+                self._toast("DNS刷新", "DNS缓存已成功刷新", bootstyle="success", duration=1800)
         except: pass
 
     def view_hosts_file(self):
