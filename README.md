@@ -32,8 +32,8 @@
 🎨 **现代化 Glass UI 设计**  
 采用玻璃拟态设计语言，渐变背景 + 卡片式布局，视觉效果精致流畅
 
-⚡ **60 线程并发测速**  
-基于 ThreadPoolExecutor 的高性能并发架构，测速速度提升 10 倍以上
+⚡ **高性能并发测速架构**  
+基于 ThreadPoolExecutor 的可配置并发架构，支持 TCP/TLS/ICMP 多种测速方式，测速速度提升 10 倍以上
 
 🔄 **多源智能切换**  
 支持 7+ 个远程 Hosts 数据源，自动按优先级切换，确保数据获取成功率
@@ -44,7 +44,19 @@
 🧠 **智能 DNS 解析**  
 支持批量域名并发解析，自动去重并聚合多个 IP 地址
 
-📊 **实时测速反馈**  
+📊 **高级测速指标**  
+支持延迟、抖动、稳定性等多维度测速，精准评估 IP 质量
+
+🔒 **TLS/SNI 验证**  
+支持 HTTPS 证书验证，确保 IP 可用于 HTTPS 访问
+
+📡 **ICMP 回退机制**  
+TCP 测速失败时自动使用 ICMP ping 补充，提高测速成功率
+
+💾 **自动备份与回滚**  
+写入 Hosts 前自动备份，支持一键回滚到历史版本
+
+📈 **实时测速反馈**  
 进度条 + 状态栏实时显示测速进度，斑马纹 + 状态着色提升数据可读性
 
 ---
@@ -101,6 +113,7 @@
 **结果列表特性**：
 - ✅ **斑马纹行样式**：提升数据可读性
 - ✅ **状态着色**：可用（绿色）/ 超时（红色）
+- ✅ **多维度指标**：延迟、抖动、稳定性全面展示
 - ✅ **自动排序**：按延迟从低到高排序
 - ✅ **批量选择**：点击「选择」列复选框批量勾选
 - ✅ **实时更新**：测速过程中动态插入新结果
@@ -151,10 +164,10 @@ Pillow>=10.0.0          # 图像处理（可选）
 #### 4. 启动程序
 ```bash
 # Windows（自动提权）
-python main_modern.py
+python main.py
 
 # macOS/Linux（需手动提权）
-sudo python main_modern.py
+sudo python main.py
 ```
 
 ---
@@ -322,16 +335,64 @@ sudo systemctl restart nscd
 │                  │  Pillow (背景绘制)        │
 ├──────────────────┼──────────────────────────┤
 │  Logic Layer     │  concurrent.futures      │
-│                  │  threading                │
-│                  │  socket (TCP 探测)        │
+│                  │  threading / asyncio      │
+│                  │  socket (TCP/ICMP 探测)   │
+│                  │  ssl (TLS/SNI 验证)       │
 ├──────────────────┼──────────────────────────┤
 │  Network Layer   │  requests + HTTPAdapter  │
 │                  │  Retry 策略               │
 ├──────────────────┼──────────────────────────┤
 │  System Layer    │  ctypes (权限提升)        │
 │                  │  subprocess (DNS 刷新)    │
+│                  │  shutil (备份/回滚)       │
 └─────────────────────────────────────────────┘
 ```
+
+---
+
+### 代码结构
+
+本项目采用**模块化分层架构**，将 UI、业务逻辑、系统操作分离，便于维护和扩展。
+
+```plaintext
+SmartHostsTool-github/
+├── main.py                 # 程序入口：支持 GUI 模式和 writer mode（提权写入）
+├── main_window.py          # UI 层：主窗口界面、交互逻辑、状态更新
+├── about_window.py         # UI 层：关于窗口、使用说明
+├── services.py             # 业务逻辑层：远程 Hosts 获取、DNS 解析、测速
+├── hosts_file.py           # 系统层：Hosts 文件读写、备份、DNS 刷新
+├── config.py               # 配置层：集中管理常量、配置项
+├── ui_visuals.py           # UI 视觉层：玻璃拟态背景绘制
+├── utils.py                # 工具层：资源路径、权限管理、原子写入
+├── icon.ico                # 程序图标
+├── 头像.jpg                # 关于界面头像
+├── requirements.txt        # 依赖清单
+├── README.md               # 项目文档
+├── LICENSE                 # MIT 许可证
+└── docs/                   # 文档资源
+    └── screenshots/        # 界面截图
+```
+
+#### 模块说明
+
+| 模块 | 职责 | 依赖 |
+|------|------|------|
+| **main.py** | 程序入口，支持 GUI 模式和 writer mode（提权后写入 Hosts） | ttkbootstrap, hosts_file, utils |
+| **main_window.py** | 主窗口 UI 布局、事件处理、调用 services 完成业务逻辑 | ttkbootstrap, services, hosts_file, ui_visuals |
+| **about_window.py** | 关于窗口、使用说明展开/收起 | ttkbootstrap, ui_visuals, utils |
+| **services.py** | 远程 Hosts 获取、DNS 解析、TCP/TLS/ICMP 测速 | requests, socket, ssl, asyncio |
+| **hosts_file.py** | Hosts 文件读写、自动备份、回滚、DNS 刷新 | shutil, subprocess, codecs |
+| **config.py** | 集中管理所有配置常量（远程源、超时、线程数等） | 无 |
+| **ui_visuals.py** | 玻璃拟态背景绘制（渐变 + 光晕 + 噪点） | Pillow（可选） |
+| **utils.py** | 资源路径兼容 PyInstaller、管理员权限管理、原子写入 | ctypes, json, tempfile |
+
+#### 设计亮点
+
+1. **分层清晰**：UI 层不直接操作系统文件，通过 hosts_file.py 封装；业务逻辑独立于 UI，便于测试
+2. **模块解耦**：services.py 不依赖 tkinter/ttkbootstrap，可独立测试；hosts_file.py 不依赖 UI 框架
+3. **可配置性**：所有配置集中在 config.py，便于后期扩展和调整
+4. **兼容性**：utils.py 提供资源路径兼容 PyInstaller，支持源码和打包两种运行方式
+5. **容错性**：Pillow 不可用时自动降级为纯色背景；platformdirs 不可用时回退到 %LOCALAPPDATA%
 
 ---
 
