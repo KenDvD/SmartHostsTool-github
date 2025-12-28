@@ -39,6 +39,7 @@ from config import (
     HTTP_CLIENT_CONFIG,
     DNS_RESOLVER_CONFIG,
 )
+from utils import get_logger
 
 
 # ---------------------------------------------------------------------
@@ -620,7 +621,7 @@ class SpeedTester:
         host: str,
         *,
         port: int = 443,
-        timeout: float = 2.5,
+        timeout: float = 3.0,
         verify_hostname: bool = True,
     ) -> Tuple[bool, Optional[str]]:
         """对 (ip:port) 执行一次 TLS 握手，并使用 host 作为 SNI/主机名校验。
@@ -662,7 +663,7 @@ class SpeedTester:
         hosts: Iterable[str],
         *,
         port: int = 443,
-        timeout: float = 2.5,
+        timeout: float = 3.0,
         verify_hostname: bool = True,
         limit: int = 3,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
@@ -699,7 +700,7 @@ class SpeedTester:
         host: str,
         *,
         port: int = 443,
-        timeout: float = 2.5,
+        timeout: float = 3.0,
         verify_hostname: bool = True,
     ) -> Tuple[bool, Optional[str]]:
         """异步 TLS/SNI 验证（与 tls_sni_verify 语义一致）。"""
@@ -769,7 +770,7 @@ class SpeedTester:
         ip: str,
         *,
         port: int = 443,
-        attempts: int = 3,
+        attempts: int = 5,
         timeout: float = 2.0,
     ) -> Tuple[Optional[float], bool, Optional[str]]:
         """TCP 多次取中位数（更稳），支持 IPv4/IPv6。返回 (median_ms, ok_bool, last_err)。"""
@@ -793,7 +794,7 @@ class SpeedTester:
         ip: str,
         *,
         port: int = 443,
-        attempts: int = 3,
+        attempts: int = 5,
         timeout: float = 2.0,
     ) -> Tuple[Optional[float], bool, Optional[str]]:
         """异步 TCP 多次取中位数，支持 IPv4/IPv6。返回 (median_ms, ok_bool, last_err)。"""
@@ -854,7 +855,7 @@ class SpeedTester:
         ip: str,
         *,
         port: int = 443,
-        attempts: int = 10,
+        attempts: int = 5,
         timeout: float = 2.0,
     ) -> Dict[str, Any]:
         """返回详细测速指标，包含延迟波动分析，支持 IPv4/IPv6。"""
@@ -922,7 +923,7 @@ class SpeedTester:
         ip: str,
         *,
         port: int = 443,
-        attempts: int = 3,
+        attempts: int = 5,
         timeout: float = 2.0,
         icmp_timeout_ms: int = 2000,
         sni_host: Optional[str] = None,
@@ -991,7 +992,7 @@ class SpeedTester:
         ip: str,
         *,
         port: int = 443,
-        attempts: int = 10,
+        attempts: int = 5,
         timeout: float = 2.0,
         icmp_timeout_ms: int = 2000,
         measure_jitter: bool = True,
@@ -1073,7 +1074,7 @@ class SpeedTester:
         ip: str,
         *,
         port: int = 443,
-        attempts: int = 10,
+        attempts: int = 5,
         timeout: float = 2.0,
         icmp_timeout_ms: int = 2000,
         measure_jitter: bool = True,
@@ -1189,7 +1190,7 @@ class EnhancedSpeedTester(SpeedTester):
         advanced_config = self.config.get("advanced", {})
 
         port = kwargs.get("port", tcp_config.get("port", 443))
-        attempts = kwargs.get("attempts", tcp_config.get("attempts", 10))
+        attempts = kwargs.get("attempts", tcp_config.get("attempts", 5))
         timeout = kwargs.get("timeout", tcp_config.get("timeout", 2.0))
         measure_jitter = advanced_config.get("measure_jitter", True)
 
@@ -1240,7 +1241,7 @@ class EnhancedSpeedTester(SpeedTester):
         advanced_config = self.config.get("advanced", {})
 
         port = kwargs.get("port", tcp_config.get("port", 443))
-        attempts = kwargs.get("attempts", tcp_config.get("attempts", 10))
+        attempts = kwargs.get("attempts", tcp_config.get("attempts", 5))
         timeout = kwargs.get("timeout", tcp_config.get("timeout", 2.0))
         measure_jitter = advanced_config.get("measure_jitter", True)
 
@@ -1322,6 +1323,7 @@ class SpeedTestConfigManager:
     
     def load_config(self) -> Dict[str, Any]:
         """从文件加载配置，如果不存在则返回默认配置"""
+        logger = get_logger()
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
@@ -1334,25 +1336,30 @@ class SpeedTestConfigManager:
                     else:
                         config[key] = value
                 
+                logger.info(f"成功加载测速配置: {self.config_file}")
                 return config
             except (json.JSONDecodeError, OSError, ValueError) as e:
-                print(f"加载配置文件失败: {e}")
+                logger.warning(f"加载配置文件失败: {e}，使用默认配置")
             except Exception as e:
-                print(f"加载配置文件时发生未知错误: {e}")
+                logger.exception(f"加载配置文件时发生未知错误: {e}，使用默认配置")
+        else:
+            logger.debug(f"配置文件不存在: {self.config_file}，使用默认配置")
         
         return SPEED_TEST_CONFIG.copy()
     
     def save_config(self, config: Dict[str, Any]) -> bool:
         """保存配置到文件"""
+        logger = get_logger()
         try:
             os.makedirs(self.config_dir, exist_ok=True)
             
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
             
+            logger.info(f"成功保存测速配置: {self.config_file}")
             return True
         except Exception as e:
-            print(f"保存配置文件失败: {e}")
+            logger.error(f"保存配置文件失败: {e}", exc_info=True)
             return False
     
     def reset_to_default(self) -> Dict[str, Any]:

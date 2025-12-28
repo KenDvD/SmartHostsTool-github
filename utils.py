@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Any, List, Optional
 
 
@@ -250,3 +253,98 @@ def write_file_lines(file_path: str, lines: List[str], encoding: str = "utf-8") 
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------
+# 日志系统
+# ---------------------------------------------------------------------
+_logger: Optional[logging.Logger] = None
+
+
+def setup_logger(
+    app_name: str = "SmartHostsTool",
+    *,
+    log_level: int = logging.INFO,
+    max_bytes: int = 10 * 1024 * 1024,  # 10MB
+    backup_count: int = 5,
+    console_output: bool = True,
+) -> logging.Logger:
+    """配置并返回日志记录器。
+
+    Args:
+        app_name: 应用名称，用于日志目录和文件名
+        log_level: 日志级别，默认 INFO
+        max_bytes: 单个日志文件最大大小（字节），默认 10MB
+        backup_count: 保留的备份文件数量，默认 5 个
+        console_output: 是否输出到控制台，默认 True
+
+    Returns:
+        配置好的 Logger 实例
+    """
+    global _logger
+
+    if _logger is not None:
+        return _logger
+
+    # 获取日志目录
+    log_dir = user_data_dir(app_name)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # 日志文件名：app_YYYYMMDD.log
+    log_filename = os.path.join(log_dir, f"app_{datetime.now().strftime('%Y%m%d')}.log")
+
+    # 创建 logger
+    logger = logging.getLogger(app_name)
+    logger.setLevel(log_level)
+
+    # 避免重复添加 handler
+    if logger.handlers:
+        return logger
+
+    # 日志格式
+    formatter = logging.Formatter(
+        fmt='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 文件 handler（带轮转）
+    file_handler = RotatingFileHandler(
+        log_filename,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding='utf-8',
+        delay=False,
+    )
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # 控制台 handler（可选）
+    if console_output:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    logger.info(f"日志系统已初始化，日志文件：{log_filename}")
+    _logger = logger
+    return logger
+
+
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """获取日志记录器。
+
+    Args:
+        name: 日志记录器名称，默认使用 APP_NAME
+
+    Returns:
+        Logger 实例
+    """
+    if name is None:
+        try:
+            from config import APP_NAME
+            name = APP_NAME
+        except Exception:
+            name = "SmartHostsTool"
+
+    return logging.getLogger(name)

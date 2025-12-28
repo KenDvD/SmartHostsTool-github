@@ -81,7 +81,7 @@ class AboutWindow:
         master,
         *,
         app_name: str = "智能Hosts测速工具",
-        version: str = "V1.7",
+        version: str = "V1.8",
         author: str = "毕加索自画像",
         github_profile_url: str = "https://github.com/KenDvD",
         github_repo_url: str = "https://github.com/KenDvD/SmartHostsTool-github",

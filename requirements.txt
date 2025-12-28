@@ -1,3 +1,31 @@
-ttkbootstrap==1.10.1
-requests==2.31.0
-dnspython==2.4.2
+# 智能 Hosts 测速工具 - 依赖库列表
+# SmartHostsTool Dependencies
+
+# 核心 UI 框架
+ttkbootstrap>=1.10.1
+
+# 网络请求库
+requests>=2.25.1
+
+# 图像处理库（可选，用于玻璃质感背景和头像处理）
+Pillow>=8.0.0
+
+# 系统托盘功能（可选）
+pystray>=0.19.0
+
+# 用户数据目录管理（可选，有内置回退方案）
+platformdirs>=2.0.0
+
+# 注意事项：
+# 1. ttkbootstrap 是必需的，用于现代化 UI 界面
+# 2. requests 是必需的，用于获取远程 Hosts 数据
+# 3. Pillow 是可选的，没有它程序仍可运行，但会失去玻璃质感背景效果
+# 4. pystray 是可选的，没有它程序仍可运行，但会失去系统托盘功能
+# 5. platformdirs 是可选的，没有它会回退到使用 %LOCALAPPDATA% 目录
+# 6. 其他库（如 asyncio, concurrent.futures, socket 等）都是 Python 标准库，无需安装
+
+# 最小安装（仅核心功能）：
+# pip install ttkbootstrap requests
+
+# 完整安装（包含所有功能）：
+# pip install -r requirements.txt

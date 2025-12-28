@@ -64,19 +64,26 @@ REMOTE_HOSTS_SOURCE_CHOICES = [
 
 SPEED_TEST_CONFIG = {
     "tcp": {
+        # 端口：HTTPS标准端口
         "port": 443,
-        "attempts": 10,
+        # 尝试次数：5次平衡速度和准确性（3-5次足够，10次太慢）
+        "attempts": 5,
+        # 超时时间：2秒适合大多数网络环境（1-3秒合理）
         "timeout": 2.0,
+        # 间隔时间：20ms避免过于频繁的连接
         "interval": 0.02,
     },
     "tls": {
+        # 启用TLS/SNI验证：确保IP真正可用
         "enabled": True,
-        "timeout": 2.5,
+        # TLS超时：比TCP稍长，因为TLS握手需要更多时间
+        "timeout": 3.0,
+        # 验证主机名：False避免证书验证问题（大多数情况下不需要严格验证）
         "verify_hostname": False,
+        # strict=False：TCP可用即保留，写入时优先选TLS通过的（更灵活）
         # strict=True  -> TLS/SNI 验证失败则判定该 IP 不可用（更安全，可能更"挑"）
-        # strict=False -> TCP 可用即保留为"可用(TCP,TLS失败)"（不至于全红；写入最优时仍优先选 TLS 通过的）
         "strict": False,
-        # 对同一 IP，最多尝试多少个候选域名做 SNI 验证（避免一开始选到不匹配域名导致误判）
+        # 尝试域名数量：3个足够，避免尝试太多域名导致测速变慢
         "try_hosts_limit": 3,
         # 候选域名优先级（存在于该 IP 关联域名列表时优先尝试）
         "preferred_hosts": [
@@ -88,17 +95,25 @@ SPEED_TEST_CONFIG = {
         ],
     },
     "icmp": {
+        # 启用ICMP：作为TCP失败的补充
         "enabled": True,
+        # 超时时间：2秒合理
         "timeout_ms": 2000,
+        # 仅在TCP失败时使用：避免重复测速
         "fallback_only": True,
     },
     "retry": {
+        # 启用重试：提高测速成功率
         "enabled": True,
+        # 最大重试次数：2次足够，避免过度重试
         "max_retries": 2,
+        # 退避因子：1.5倍递增，合理
         "backoff_factor": 1.5,
     },
     "advanced": {
+        # 测量抖动：提供更详细的网络质量信息
         "measure_jitter": True,
+        # 计算稳定性分数：帮助选择更稳定的IP
         "calculate_stability": True,
     },
 }
@@ -148,4 +163,40 @@ UI_CONFIG = {
     "delay_thresholds": {
         "warning_ms": 200,
     },
+}
+
+# 日志系统配置
+# level: 日志级别（DEBUG, INFO, WARNING, ERROR, CRITICAL）
+# max_bytes: 单个日志文件最大大小（字节），默认 10MB
+# backup_count: 保留的备份文件数量
+# console_output: 是否输出到控制台
+LOG_CONFIG = {
+    "level": "INFO",  # 可选: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    "max_bytes": 10 * 1024 * 1024,  # 10MB
+    "backup_count": 5,
+    "console_output": True,
+}
+
+# 定时测速配置
+# enabled: 是否启用定时测速
+# interval_minutes: 测速间隔（分钟），推荐 30-240 分钟
+# auto_write_best: 测速完成后是否自动写入最优 IP
+# notify_on_complete: 测速完成后是否显示通知
+# only_when_idle: 仅在系统空闲时执行（减少性能影响）
+SCHEDULED_TEST_CONFIG = {
+    "enabled": False,
+    "interval_minutes": 60,
+    "auto_write_best": True,
+    "notify_on_complete": True,
+    "only_when_idle": True,
+}
+
+# 系统托盘配置
+# minimize_to_tray: 关闭窗口时最小化到托盘而非退出
+# show_notifications: 是否显示托盘通知
+# start_minimized: 启动时最小化到托盘
+TRAY_CONFIG = {
+    "minimize_to_tray": True,
+    "show_notifications": True,
+    "start_minimized": False,
 }

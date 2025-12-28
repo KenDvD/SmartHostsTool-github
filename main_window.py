@@ -34,11 +34,13 @@ from config import (
     REMOTE_HOSTS_URLS,
     UI_CONFIG,
     SPEED_TEST_CONFIG,
+    SCHEDULED_TEST_CONFIG,
+    TRAY_CONFIG,
 )
 from hosts_file import HostsFileManager
-from services import DomainResolver, RemoteHostsClient, SpeedTester, EnhancedSpeedTester
+from services import DomainResolver, RemoteHostsClient, SpeedTester, EnhancedSpeedTester, SpeedTestConfigManager
 from ui_visuals import GlassBackground
-from utils import atomic_write_json, is_admin, resource_path, safe_read_json, user_data_path
+from utils import atomic_write_json, get_logger, is_admin, resource_path, safe_read_json, user_data_path
 
 # 主窗口尺寸配置（像素）
 # MAIN_WINDOW_WIDTH_PX: 主窗口宽度（推荐 1000-1200px）
@@ -182,11 +184,20 @@ class HostsOptimizer(ttk.Frame):
         super().__init__(master, padding=0)
         self.master = master
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # 初始化日志记录器
+        self.logger = get_logger()
+        self.logger.info("初始化 HostsOptimizer 主窗口")
 
         # Services / Managers
         self.remote_client = RemoteHostsClient(urls=list(REMOTE_HOSTS_URLS))
         self.resolver = DomainResolver(max_workers=UI_OTHER_VALUES["resolver_max_workers"])
         self.hosts_mgr = HostsFileManager(hosts_path=HOSTS_PATH)
+        
+        # 测速配置管理器
+        self.speed_test_config_manager = SpeedTestConfigManager()
+        self.speed_test_config = self.speed_test_config_manager.load_config()
+        self.logger.info("测速配置管理器已初始化")
 
         # 远程 Hosts 来源（用于 UI 展示）
         self.remote_hosts_source_url: Optional[str] = None
@@ -234,6 +245,22 @@ class HostsOptimizer(ttk.Frame):
         self.advanced_metrics_var = BooleanVar(value=True)
 
         self._about = None
+        
+        # 定时测速相关
+        self._scheduled_test_enabled = False
+        self._scheduled_test_interval = SCHEDULED_TEST_CONFIG.get("interval_minutes", 60)
+        self._scheduled_test_auto_write = SCHEDULED_TEST_CONFIG.get("auto_write_best", True)
+        self._scheduled_test_after_id = None
+        self._last_scheduled_test_time = None
+        self._scheduled_test_domains: List[str] = []  # 定时测速的目标域名列表
+        self._is_scheduled_test_running = False  # 标记当前是否是定时测速
+        
+        # 系统托盘相关
+        self._tray_icon = None
+        self._minimize_to_tray = TRAY_CONFIG.get("minimize_to_tray", True)
+        
+        # 加载定时测速配置
+        self._load_scheduled_test_config()
 
         # UI
         self._setup_style()
@@ -253,19 +280,461 @@ class HostsOptimizer(ttk.Frame):
     # 生命周期
     # -----------------------------------------------------------------
     def on_close(self):
-        """退出清理"""
+        """关闭窗口处理：支持最小化到托盘"""
+        # 如果启用了托盘且托盘可用，最小化到托盘而非退出
+        if self._minimize_to_tray and self._tray_icon and self._tray_icon.is_running:
+            self.logger.info("最小化到系统托盘")
+            self.hide_window()
+            return
+        
+        # 否则执行真正的退出
+        self.force_exit()
+    
+    def force_exit(self):
+        """强制退出程序（清理所有资源）"""
+        self.logger.info("用户关闭窗口，开始清理资源...")
+        
+        # 停止定时测速
+        self._stop_scheduled_test()
+        
+        # 停止当前测速
         self.stop_test = True
         self._stop_event.set()
         if self.executor:
             try:
                 self.executor.shutdown(wait=False)
-            except Exception:
-                pass
+                self.logger.debug("线程池已关闭")
+            except Exception as e:
+                self.logger.warning(f"关闭线程池时出错: {e}")
+        
+        # 停止托盘
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception as e:
+                self.logger.warning(f"停止托盘时出错: {e}")
+        
         try:
             self.master.destroy()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"销毁窗口时出错: {e}")
+        self.logger.info("程序退出")
         sys.exit(0)
+    
+    def hide_window(self):
+        """隐藏窗口到托盘"""
+        try:
+            self.master.withdraw()
+            if self._tray_icon:
+                self._tray_icon.set_window_visible(False)
+                self._tray_icon.show_notification(
+                    "智能Hosts测速工具",
+                    "程序已最小化到系统托盘，双击图标可恢复窗口"
+                )
+            self.logger.debug("窗口已隐藏到托盘")
+        except Exception as e:
+            self.logger.warning(f"隐藏窗口失败: {e}")
+    
+    def show_window(self):
+        """从托盘恢复显示窗口"""
+        try:
+            self.master.deiconify()
+            self.master.lift()
+            self.master.focus_force()
+            if self._tray_icon:
+                self._tray_icon.set_window_visible(True)
+            self.logger.debug("窗口已从托盘恢复")
+        except Exception as e:
+            self.logger.warning(f"显示窗口失败: {e}")
+    
+    def minimize_to_tray(self):
+        """手动最小化到托盘"""
+        if self._tray_icon and self._tray_icon.is_running:
+            self.hide_window()
+        else:
+            messagebox.showinfo("提示", "系统托盘功能不可用。\n请安装 pystray 和 Pillow 库：\npip install pystray Pillow")
+    
+    def set_tray_icon(self, tray_icon):
+        """设置托盘图标实例（由 main.py 调用）"""
+        self._tray_icon = tray_icon
+        self.logger.info("托盘图标已关联到主窗口")
+    
+    # -----------------------------------------------------------------
+    # 定时测速功能
+    # -----------------------------------------------------------------
+    def _load_scheduled_test_config(self):
+        """从用户配置文件加载定时测速设置"""
+        config_path = user_data_path(APP_NAME, "scheduled_test.json")
+        config = safe_read_json(config_path, None)
+        if config:
+            self._scheduled_test_enabled = config.get("enabled", False)
+            self._scheduled_test_interval = config.get("interval_minutes", 60)
+            self._scheduled_test_auto_write = config.get("auto_write_best", True)
+            self._scheduled_test_domains = config.get("domains", [])
+            self.logger.info(f"加载定时测速配置: enabled={self._scheduled_test_enabled}, interval={self._scheduled_test_interval}分钟, domains={len(self._scheduled_test_domains)}个")
+            
+            # 如果启用了定时测速，启动调度器
+            if self._scheduled_test_enabled and self._scheduled_test_domains:
+                self._start_scheduled_test()
+    
+    def _save_scheduled_test_config(self):
+        """保存定时测速配置"""
+        config_path = user_data_path(APP_NAME, "scheduled_test.json")
+        config = {
+            "enabled": self._scheduled_test_enabled,
+            "interval_minutes": self._scheduled_test_interval,
+            "auto_write_best": self._scheduled_test_auto_write,
+            "domains": self._scheduled_test_domains,
+        }
+        try:
+            atomic_write_json(config_path, config)
+            self.logger.info("定时测速配置已保存")
+        except Exception as e:
+            self.logger.error(f"保存定时测速配置失败: {e}")
+    
+    def _start_scheduled_test(self):
+        """启动定时测速调度器"""
+        if self._scheduled_test_after_id:
+            return  # 已经在运行
+        
+        interval_ms = self._scheduled_test_interval * 60 * 1000
+        self._scheduled_test_after_id = self.master.after(interval_ms, self._run_scheduled_test)
+        self.logger.info(f"定时测速已启动，间隔 {self._scheduled_test_interval} 分钟")
+        
+        # 更新状态栏
+        self.status_label.config(text=f"定时测速已启用（每 {self._scheduled_test_interval} 分钟）", bootstyle=INFO)
+    
+    def _stop_scheduled_test(self):
+        """停止定时测速调度器"""
+        if self._scheduled_test_after_id:
+            try:
+                self.master.after_cancel(self._scheduled_test_after_id)
+            except Exception:
+                pass
+            self._scheduled_test_after_id = None
+            self.logger.info("定时测速已停止")
+    
+    def _run_scheduled_test(self):
+        """执行定时测速任务"""
+        import datetime
+        self._last_scheduled_test_time = datetime.datetime.now()
+        self.logger.info(f"开始执行定时测速任务，目标域名: {self._scheduled_test_domains}")
+        
+        # 检查是否有配置的域名
+        if not self._scheduled_test_domains:
+            self.logger.warning("定时测速：未配置目标域名，跳过本次测速")
+            self._schedule_next_test()
+            return
+        
+        # 清空旧数据，准备新测速
+        self.remote_hosts_data = []
+        self.smart_resolved_ips = []
+        
+        # 使用配置的域名列表进行解析
+        self.current_selected_presets = list(self._scheduled_test_domains)
+        self.is_github_selected = GITHUB_TARGET_DOMAIN in self._scheduled_test_domains
+        
+        # 如果包含 github.com，先刷新远程 Hosts
+        if self.is_github_selected:
+            self.logger.info("定时测速：刷新远程Hosts...")
+            threading.Thread(target=self._scheduled_fetch_and_test, daemon=True).start()
+        else:
+            # 直接解析并测速
+            self.logger.info("定时测速：解析域名IP...")
+            threading.Thread(target=self._scheduled_resolve_and_test, daemon=True).start()
+    
+    def _schedule_next_test(self):
+        """安排下一次定时测速"""
+        if self._scheduled_test_enabled:
+            interval_ms = self._scheduled_test_interval * 60 * 1000
+            self._scheduled_test_after_id = self.master.after(interval_ms, self._run_scheduled_test)
+    
+    def _scheduled_fetch_and_test(self):
+        """定时测速：获取远程Hosts并测速"""
+        import asyncio
+        try:
+            async def fetch_async():
+                try:
+                    records, used_url = await self.remote_client.fetch_github_hosts_async(concurrent=True)
+                    self.remote_hosts_data = records
+                    self.logger.info(f"定时测速：获取到 {len(records)} 条远程Hosts记录")
+                except Exception as e:
+                    self.logger.error(f"定时测速：获取远程Hosts失败: {e}")
+            
+            asyncio.run(fetch_async())
+        except Exception as e:
+            self.logger.error(f"定时测速：获取远程Hosts异常: {e}")
+        
+        # 继续解析其他域名
+        self._scheduled_resolve_and_test()
+    
+    def _scheduled_resolve_and_test(self):
+        """定时测速：解析域名并测速"""
+        try:
+            # 解析非 GitHub 域名
+            non_github_domains = [d for d in self._scheduled_test_domains if d != GITHUB_TARGET_DOMAIN]
+            if non_github_domains:
+                self.logger.info(f"定时测速：解析 {len(non_github_domains)} 个域名...")
+                resolved = self.resolver.resolve(non_github_domains)
+                self.smart_resolved_ips = resolved
+                self.logger.info(f"定时测速：解析到 {len(resolved)} 个IP")
+            
+            # 在主线程中启动测速
+            self.master.after(0, self._start_scheduled_speed_test)
+        except Exception as e:
+            self.logger.error(f"定时测速：解析域名失败: {e}")
+            self._schedule_next_test()
+    
+    def _start_scheduled_speed_test(self):
+        """在主线程中启动定时测速"""
+        if self.remote_hosts_data or self.smart_resolved_ips:
+            self.logger.info("定时测速：开始测速...")
+            # 标记这是定时测速，完成后调用回调
+            self._is_scheduled_test_running = True
+            self.start_test()
+        else:
+            self.logger.warning("定时测速：没有可测试的IP")
+            self._schedule_next_test()
+    
+    def _on_scheduled_test_complete(self):
+        """定时测速完成后的回调"""
+        if self._scheduled_test_auto_write:
+            # 自动写入最优 IP
+            self.logger.info("定时测速完成，自动写入最优IP")
+            self.write_best_ip_to_hosts()
+        
+        # 托盘通知
+        if self._tray_icon and self._tray_icon.is_running:
+            self._tray_icon.show_notification(
+                "定时测速完成",
+                f"已测试 {self.total_ip_tests} 个IP，{'已自动写入最优IP' if self._scheduled_test_auto_write else '请手动选择写入'}"
+            )
+    
+    def show_scheduled_test_settings(self):
+        """显示定时测速设置窗口"""
+        self.logger.info("打开定时测速设置窗口")
+        
+        settings_window = ttk.Toplevel(self.master)
+        settings_window.title("定时测速设置")
+        settings_window.geometry("680x820")
+        settings_window.resizable(True, True)
+        settings_window.minsize(620, 750)
+        
+        # 居中
+        try:
+            settings_window.place_window_center()
+        except Exception:
+            sw = settings_window.winfo_screenwidth()
+            sh = settings_window.winfo_screenheight()
+            x = int(sw / 2 - 340)
+            y = int(sh / 2 - 410)
+            settings_window.geometry(f"680x820+{x}+{y}")
+        
+        # 模态
+        settings_window.transient(self.master)
+        settings_window.grab_set()
+        
+        # 主容器
+        container = ttk.Frame(settings_window, padding=20)
+        container.pack(fill=BOTH, expand=True)
+        
+        # 标题
+        title = ttk.Label(
+            container,
+            text="定时测速设置",
+            font=("Segoe UI", 16, "bold"),
+            bootstyle="primary",
+        )
+        title.pack(pady=(0, 15))
+        
+        # 启用开关
+        enabled_var = BooleanVar(value=self._scheduled_test_enabled)
+        enabled_frame = ttk.Frame(container)
+        enabled_frame.pack(fill=X, pady=8)
+        ttk.Checkbutton(
+            enabled_frame,
+            text="启用定时自动测速",
+            variable=enabled_var,
+            bootstyle="success-round-toggle",
+        ).pack(side=LEFT)
+        
+        # 间隔设置
+        interval_frame = ttk.Frame(container)
+        interval_frame.pack(fill=X, pady=8)
+        ttk.Label(interval_frame, text="测速间隔：", font=("Segoe UI", 10)).pack(side=LEFT)
+        interval_var = StringVar(value=str(self._scheduled_test_interval))
+        interval_entry = ttk.Entry(interval_frame, textvariable=interval_var, width=10)
+        interval_entry.pack(side=LEFT, padx=5)
+        ttk.Label(interval_frame, text="分钟（推荐：30-240）", font=("Segoe UI", 9), bootstyle="secondary").pack(side=LEFT)
+        
+        # 自动写入
+        auto_write_var = BooleanVar(value=self._scheduled_test_auto_write)
+        ttk.Checkbutton(
+            container,
+            text="测速完成后自动写入最优IP到Hosts",
+            variable=auto_write_var,
+        ).pack(anchor=W, pady=8)
+        
+        # 域名选择区域
+        domain_frame = ttk.Labelframe(container, text="选择要定时测速的域名", padding=10)
+        domain_frame.pack(fill=BOTH, expand=True, pady=10)
+        
+        # 域名列表（带复选框）
+        domain_list_frame = ttk.Frame(domain_frame)
+        domain_list_frame.pack(fill=BOTH, expand=True)
+        
+        # 滚动条
+        scrollbar = ttk.Scrollbar(domain_list_frame)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        
+        # 使用 Treeview 显示域名列表（带复选框效果）
+        domain_tree = ttk.Treeview(
+            domain_list_frame,
+            columns=["selected", "domain"],
+            show="headings",
+            height=12,
+            yscrollcommand=scrollbar.set,
+        )
+        domain_tree.heading("selected", text="选择")
+        domain_tree.heading("domain", text="域名")
+        domain_tree.column("selected", width=60, anchor="center")
+        domain_tree.column("domain", width=400)
+        domain_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.config(command=domain_tree.yview)
+        
+        # 域名选择状态
+        domain_selected: Dict[str, BooleanVar] = {}
+        
+        # 填充域名列表（从预设列表获取）
+        for domain in self.custom_presets:
+            is_selected = domain in self._scheduled_test_domains
+            domain_selected[domain] = is_selected
+            check_mark = "✓" if is_selected else "□"
+            domain_tree.insert("", "end", values=[check_mark, domain], iid=domain)
+        
+        def toggle_domain(event):
+            """切换域名选择状态"""
+            item = domain_tree.identify_row(event.y)
+            if not item:
+                return
+            domain = item  # iid 就是域名
+            domain_selected[domain] = not domain_selected.get(domain, False)
+            check_mark = "✓" if domain_selected[domain] else "□"
+            domain_tree.item(item, values=[check_mark, domain])
+        
+        domain_tree.bind("<Button-1>", toggle_domain)
+        
+        # 快捷按钮
+        quick_btn_frame = ttk.Frame(domain_frame)
+        quick_btn_frame.pack(fill=X, pady=(10, 0))
+        
+        def select_all():
+            for domain in self.custom_presets:
+                domain_selected[domain] = True
+                domain_tree.item(domain, values=["✓", domain])
+        
+        def select_none():
+            for domain in self.custom_presets:
+                domain_selected[domain] = False
+                domain_tree.item(domain, values=["□", domain])
+        
+        def select_github():
+            for domain in self.custom_presets:
+                is_github = "github" in domain.lower()
+                domain_selected[domain] = is_github
+                check_mark = "✓" if is_github else "□"
+                domain_tree.item(domain, values=[check_mark, domain])
+        
+        ttk.Button(quick_btn_frame, text="全选", command=select_all, bootstyle="info-outline", width=8).pack(side=LEFT, padx=2)
+        ttk.Button(quick_btn_frame, text="全不选", command=select_none, bootstyle="secondary-outline", width=8).pack(side=LEFT, padx=2)
+        ttk.Button(quick_btn_frame, text="仅GitHub", command=select_github, bootstyle="success-outline", width=10).pack(side=LEFT, padx=2)
+        
+        # 已选数量提示
+        selected_count_var = StringVar(value=f"已选择 {sum(1 for v in domain_selected.values() if v)} 个域名")
+        selected_label = ttk.Label(quick_btn_frame, textvariable=selected_count_var, font=("Segoe UI", 9), bootstyle="info")
+        selected_label.pack(side=RIGHT)
+        
+        def update_selected_count(*args):
+            count = sum(1 for v in domain_selected.values() if v)
+            selected_count_var.set(f"已选择 {count} 个域名")
+        
+        # 状态显示
+        status_frame = ttk.Frame(container)
+        status_frame.pack(fill=X, pady=5)
+        if self._last_scheduled_test_time:
+            status_text = f"上次测速时间：{self._last_scheduled_test_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        else:
+            status_text = "尚未执行过定时测速"
+        ttk.Label(container, text=status_text, font=("Segoe UI", 9), bootstyle="info").pack(anchor=W, pady=5)
+        
+        # 按钮
+        btn_frame = ttk.Frame(container)
+        btn_frame.pack(fill=X, pady=(20, 0))
+        
+        def save_settings():
+            # 验证间隔
+            try:
+                interval = int(interval_var.get().strip())
+                if interval < 5 or interval > 1440:
+                    messagebox.showerror("输入错误", "测速间隔必须在 5-1440 分钟之间")
+                    return
+            except ValueError:
+                messagebox.showerror("输入错误", "请输入有效的数字")
+                return
+            
+            # 获取选中的域名
+            selected_domains = [domain for domain, selected in domain_selected.items() if selected]
+            
+            # 如果启用了定时测速，必须选择至少一个域名
+            if enabled_var.get() and not selected_domains:
+                messagebox.showerror("配置错误", "请至少选择一个要测速的域名！")
+                return
+            
+            # 保存设置
+            old_enabled = self._scheduled_test_enabled
+            self._scheduled_test_enabled = enabled_var.get()
+            self._scheduled_test_interval = interval
+            self._scheduled_test_auto_write = auto_write_var.get()
+            self._scheduled_test_domains = selected_domains
+            self._save_scheduled_test_config()
+            
+            # 根据状态启动或停止调度器
+            if self._scheduled_test_enabled and not old_enabled:
+                self._start_scheduled_test()
+                domain_str = ", ".join(selected_domains[:3])
+                if len(selected_domains) > 3:
+                    domain_str += f" 等{len(selected_domains)}个"
+                self._toast("定时测速", f"已启用，每 {interval} 分钟测速 {domain_str}", bootstyle="success")
+            elif not self._scheduled_test_enabled and old_enabled:
+                self._stop_scheduled_test()
+                self._toast("定时测速", "已停止", bootstyle="warning")
+            elif self._scheduled_test_enabled:
+                # 间隔或域名可能变了，重新调度
+                self._stop_scheduled_test()
+                self._start_scheduled_test()
+            
+            messagebox.showinfo("成功", f"定时测速设置已保存！\n\n已选择 {len(selected_domains)} 个域名进行定时测速。")
+            settings_window.destroy()
+        
+        ttk.Button(btn_frame, text="保存", command=save_settings, bootstyle="success", width=12).pack(side=RIGHT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=settings_window.destroy, bootstyle="secondary", width=12).pack(side=RIGHT)
+        
+        # 立即测试按钮
+        def run_now():
+            selected_domains = [domain for domain, selected in domain_selected.items() if selected]
+            if not selected_domains:
+                messagebox.showerror("配置错误", "请至少选择一个要测速的域名！")
+                return
+            # 保存配置并立即运行
+            self._scheduled_test_domains = selected_domains
+            self._save_scheduled_test_config()
+            settings_window.destroy()
+            self._run_scheduled_test()
+            self._toast("定时测速", "正在执行测速...", bootstyle="info")
+        
+        ttk.Button(btn_frame, text="立即测试", command=run_now, bootstyle="info-outline", width=12).pack(side=LEFT, padx=5)
+        
+        settings_window.bind("<Escape>", lambda e: settings_window.destroy())
 
     # -----------------------------------------------------------------
     # Style / Treeview
@@ -410,8 +879,13 @@ class HostsOptimizer(ttk.Frame):
         more_menu.add_checkbutton(label="📡 TCP失败时使用ICMP补充", variable=self.icmp_fallback_var)
         more_menu.add_checkbutton(label="📊 启用高级测速指标", variable=self.advanced_metrics_var)
         more_menu.add_separator()
+        more_menu.add_command(label="⏰ 定时测速设置", command=self.show_scheduled_test_settings)
+        more_menu.add_command(label="⚙️ 测速设置", command=self.show_speed_test_settings)
+        more_menu.add_separator()
+        more_menu.add_command(label="🔽 最小化到托盘", command=self.minimize_to_tray)
         more_menu.add_command(label="ℹ 关于", command=self.show_about)
         self.more_btn["menu"] = more_menu
+        self._more_menu = more_menu  # 保存引用以便动态更新
 
         # ToolTip（不影响功能）
         try:
@@ -579,8 +1053,9 @@ class HostsOptimizer(ttk.Frame):
                     duration=duration,
                     bootstyle=bootstyle,
                 ).show_toast()
+                self.logger.debug(f"Toast通知: {title} - {message}")
         except Exception as e:
-            print(f"Toast通知显示失败: {e}")
+            self.logger.warning(f"Toast通知显示失败: {e}", exc_info=True)
 
     def _format_remote_source_button_text(self, choice_label: str) -> str:
         label = (choice_label or "").strip()
@@ -603,6 +1078,453 @@ class HostsOptimizer(ttk.Frame):
                 messagebox.showinfo("关于", "SmartHostsTool\\nModern Glass UI")
         else:
             messagebox.showinfo("关于", "SmartHostsTool\\nModern Glass UI")
+
+    def show_speed_test_settings(self):
+        """显示测速设置窗口"""
+        self.logger.info("打开测速设置窗口")
+        
+        # 创建设置窗口
+        settings_window = ttk.Toplevel(self.master)
+        settings_window.title("测速设置")
+        settings_window.geometry("750x800")
+        settings_window.resizable(True, True)
+        settings_window.minsize(650, 650)
+        
+        # 居中显示
+        try:
+            settings_window.place_window_center()
+        except Exception:
+            sw = settings_window.winfo_screenwidth()
+            sh = settings_window.winfo_screenheight()
+            x = int(sw / 2 - 375)
+            y = int(sh / 2 - 400)
+            settings_window.geometry(f"750x800+{x}+{y}")
+        
+        # 模态窗口（延迟设置，确保窗口先显示）
+        def set_modal():
+            try:
+                settings_window.transient(self.master)
+                settings_window.grab_set()
+                settings_window.focus_set()
+            except Exception:
+                pass
+        
+        # 主容器 - 简化布局
+        main_container = ttk.Frame(settings_window, padding=15)
+        main_container.pack(fill=BOTH, expand=True)
+        
+        # 标题
+        title = ttk.Label(
+            main_container,
+            text="测速配置设置",
+            font=("Segoe UI", 18, "bold"),
+            bootstyle="primary",
+        )
+        title.pack(pady=(0, 15))
+        
+        # 创建 Notebook 用于分页
+        # 使用明确的尺寸确保标签页显示
+        notebook = ttk.Notebook(main_container)
+        notebook.pack(fill=BOTH, expand=True, pady=(0, 15))
+        
+        # 确保Notebook有足够的高度来显示标签
+        notebook.update_idletasks()
+        
+        # 配置变量 - 必须在函数作用域内定义，以便保存函数访问
+        tcp_config = self.speed_test_config.get("tcp", {})
+        tls_config = self.speed_test_config.get("tls", {})
+        icmp_config = self.speed_test_config.get("icmp", {})
+        retry_config = self.speed_test_config.get("retry", {})
+        advanced_config = self.speed_test_config.get("advanced", {})
+        
+        # 先创建所有Frame，确保它们都有内容
+        
+        # TCP 配置页
+        tcp_frame = ttk.Frame(notebook, padding=20)
+        # 配置grid权重，确保内容正确显示
+        tcp_frame.grid_columnconfigure(0, weight=0)
+        tcp_frame.grid_columnconfigure(1, weight=0)
+        tcp_frame.grid_columnconfigure(2, weight=1)
+        
+        ttk.Label(tcp_frame, text="端口:", font=("Segoe UI", 10)).grid(row=0, column=0, sticky=W, pady=12, padx=10)
+        port_var = StringVar(value=str(tcp_config.get("port", 443)))
+        port_entry = ttk.Entry(tcp_frame, textvariable=port_var, width=20)
+        port_entry.grid(row=0, column=1, sticky=W, padx=10)
+        ttk.Label(tcp_frame, text="(默认: 443)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=0, column=2, sticky=W, padx=10)
+        
+        ttk.Label(tcp_frame, text="尝试次数:", font=("Segoe UI", 10)).grid(row=1, column=0, sticky=W, pady=12, padx=10)
+        attempts_var = StringVar(value=str(tcp_config.get("attempts", 5)))
+        attempts_entry = ttk.Entry(tcp_frame, textvariable=attempts_var, width=20)
+        attempts_entry.grid(row=1, column=1, sticky=W, padx=10)
+        ttk.Label(tcp_frame, text="(默认: 5, 推荐: 3-10)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=1, column=2, sticky=W, padx=10)
+        
+        ttk.Label(tcp_frame, text="超时时间(秒):", font=("Segoe UI", 10)).grid(row=2, column=0, sticky=W, pady=12, padx=10)
+        timeout_var = StringVar(value=str(tcp_config.get("timeout", 2.0)))
+        timeout_entry = ttk.Entry(tcp_frame, textvariable=timeout_var, width=20)
+        timeout_entry.grid(row=2, column=1, sticky=W, padx=10)
+        ttk.Label(tcp_frame, text="(默认: 2.0, 推荐: 1.0-5.0)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=2, column=2, sticky=W, padx=10)
+        
+        ttk.Label(tcp_frame, text="间隔时间(秒):", font=("Segoe UI", 10)).grid(row=3, column=0, sticky=W, pady=12, padx=10)
+        interval_var = StringVar(value=str(tcp_config.get("interval", 0.02)))
+        interval_entry = ttk.Entry(tcp_frame, textvariable=interval_var, width=20)
+        interval_entry.grid(row=3, column=1, sticky=W, padx=10)
+        ttk.Label(tcp_frame, text="(默认: 0.02)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=3, column=2, sticky=W, padx=10)
+        
+        # 添加TCP标签页到Notebook
+        notebook.add(tcp_frame, text="TCP 设置")
+        
+        # TLS 配置页
+        tls_frame = ttk.Frame(notebook, padding=20)
+        # 配置grid权重
+        tls_frame.grid_columnconfigure(0, weight=0)
+        tls_frame.grid_columnconfigure(1, weight=0)
+        tls_frame.grid_columnconfigure(2, weight=1)
+        
+        tls_enabled_var = BooleanVar(value=tls_config.get("enabled", True))
+        tls_check = ttk.Checkbutton(
+            tls_frame,
+            text="启用 TLS/SNI 验证",
+            variable=tls_enabled_var
+        )
+        tls_check.grid(row=0, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        ttk.Label(tls_frame, text="超时时间(秒):", font=("Segoe UI", 10)).grid(row=1, column=0, sticky=W, pady=12, padx=10)
+        tls_timeout_var = StringVar(value=str(tls_config.get("timeout", 3.0)))
+        tls_timeout_entry = ttk.Entry(tls_frame, textvariable=tls_timeout_var, width=20)
+        tls_timeout_entry.grid(row=1, column=1, sticky=W, padx=10)
+        ttk.Label(tls_frame, text="(默认: 3.0, 推荐: 2.0-5.0)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=1, column=2, sticky=W, padx=10)
+        
+        verify_hostname_var = BooleanVar(value=tls_config.get("verify_hostname", False))
+        verify_check = ttk.Checkbutton(
+            tls_frame,
+            text="验证主机名",
+            variable=verify_hostname_var
+        )
+        verify_check.grid(row=2, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        strict_var = BooleanVar(value=tls_config.get("strict", False))
+        strict_check = ttk.Checkbutton(
+            tls_frame,
+            text="严格模式 (TLS失败则判定IP不可用)",
+            variable=strict_var
+        )
+        strict_check.grid(row=3, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        ttk.Label(tls_frame, text="尝试域名数量:", font=("Segoe UI", 10)).grid(row=4, column=0, sticky=W, pady=12, padx=10)
+        try_hosts_limit_var = StringVar(value=str(tls_config.get("try_hosts_limit", 3)))
+        try_hosts_limit_entry = ttk.Entry(tls_frame, textvariable=try_hosts_limit_var, width=20)
+        try_hosts_limit_entry.grid(row=4, column=1, sticky=W, padx=10)
+        ttk.Label(tls_frame, text="(默认: 3)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=4, column=2, sticky=W, padx=10)
+        
+        # 添加TLS标签页到Notebook
+        notebook.add(tls_frame, text="TLS 设置")
+        
+        # ICMP 配置页
+        icmp_frame = ttk.Frame(notebook, padding=20)
+        # 配置grid权重
+        icmp_frame.grid_columnconfigure(0, weight=0)
+        icmp_frame.grid_columnconfigure(1, weight=0)
+        icmp_frame.grid_columnconfigure(2, weight=1)
+        
+        icmp_enabled_var = BooleanVar(value=icmp_config.get("enabled", True))
+        icmp_check = ttk.Checkbutton(
+            icmp_frame,
+            text="启用 ICMP Ping",
+            variable=icmp_enabled_var
+        )
+        icmp_check.grid(row=0, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        ttk.Label(icmp_frame, text="超时时间(毫秒):", font=("Segoe UI", 10)).grid(row=1, column=0, sticky=W, pady=12, padx=10)
+        icmp_timeout_var = StringVar(value=str(icmp_config.get("timeout_ms", 2000)))
+        icmp_timeout_entry = ttk.Entry(icmp_frame, textvariable=icmp_timeout_var, width=20)
+        icmp_timeout_entry.grid(row=1, column=1, sticky=W, padx=10)
+        ttk.Label(icmp_frame, text="(默认: 2000)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=1, column=2, sticky=W, padx=10)
+        
+        fallback_only_var = BooleanVar(value=icmp_config.get("fallback_only", True))
+        fallback_check = ttk.Checkbutton(
+            icmp_frame,
+            text="仅在 TCP 失败时使用",
+            variable=fallback_only_var
+        )
+        fallback_check.grid(row=2, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        # 添加ICMP标签页到Notebook
+        notebook.add(icmp_frame, text="ICMP 设置")
+        
+        # 重试配置页
+        retry_frame = ttk.Frame(notebook, padding=20)
+        # 配置grid权重
+        retry_frame.grid_columnconfigure(0, weight=0)
+        retry_frame.grid_columnconfigure(1, weight=0)
+        retry_frame.grid_columnconfigure(2, weight=1)
+        
+        retry_enabled_var = BooleanVar(value=retry_config.get("enabled", True))
+        retry_check = ttk.Checkbutton(
+            retry_frame,
+            text="启用重试",
+            variable=retry_enabled_var
+        )
+        retry_check.grid(row=0, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        ttk.Label(retry_frame, text="最大重试次数:", font=("Segoe UI", 10)).grid(row=1, column=0, sticky=W, pady=12, padx=10)
+        max_retries_var = StringVar(value=str(retry_config.get("max_retries", 2)))
+        max_retries_entry = ttk.Entry(retry_frame, textvariable=max_retries_var, width=20)
+        max_retries_entry.grid(row=1, column=1, sticky=W, padx=10)
+        ttk.Label(retry_frame, text="(默认: 2)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=1, column=2, sticky=W, padx=10)
+        
+        ttk.Label(retry_frame, text="退避因子:", font=("Segoe UI", 10)).grid(row=2, column=0, sticky=W, pady=12, padx=10)
+        backoff_factor_var = StringVar(value=str(retry_config.get("backoff_factor", 1.5)))
+        backoff_factor_entry = ttk.Entry(retry_frame, textvariable=backoff_factor_var, width=20)
+        backoff_factor_entry.grid(row=2, column=1, sticky=W, padx=10)
+        ttk.Label(retry_frame, text="(默认: 1.5)", font=("Segoe UI", 9), bootstyle="secondary").grid(row=2, column=2, sticky=W, padx=10)
+        
+        # 添加重试标签页到Notebook
+        notebook.add(retry_frame, text="重试设置")
+        
+        # 高级配置页
+        advanced_frame = ttk.Frame(notebook, padding=20)
+        # 配置grid权重
+        advanced_frame.grid_columnconfigure(0, weight=1)
+        
+        measure_jitter_var = BooleanVar(value=advanced_config.get("measure_jitter", True))
+        jitter_check = ttk.Checkbutton(
+            advanced_frame,
+            text="测量抖动 (Jitter)",
+            variable=measure_jitter_var
+        )
+        jitter_check.grid(row=0, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        calculate_stability_var = BooleanVar(value=advanced_config.get("calculate_stability", True))
+        stability_check = ttk.Checkbutton(
+            advanced_frame,
+            text="计算稳定性分数",
+            variable=calculate_stability_var
+        )
+        stability_check.grid(row=1, column=0, columnspan=3, sticky=W, pady=12, padx=10)
+        
+        # 添加高级设置标签页到Notebook
+        notebook.add(advanced_frame, text="高级设置")
+        
+        # 立即更新Notebook以确保标签页显示
+        notebook.update_idletasks()
+        settings_window.update_idletasks()
+        settings_window.update()
+        
+        # 验证所有标签页都已添加
+        tab_count = len(notebook.tabs())
+        try:
+            tab_names = [notebook.tab(tab, 'text') for tab in notebook.tabs()]
+        except Exception as e:
+            tab_names = []
+            self.logger.warning(f"获取标签页名称失败: {e}")
+        
+        self.logger.info(f"测速设置窗口已创建，共 {tab_count} 个标签页")
+        if tab_names:
+            self.logger.info(f"标签页名称列表: {tab_names}")
+        
+        if tab_count != 5:
+            self.logger.error(f"标签页数量异常！期望5个，实际{tab_count}个")
+            if tab_names:
+                self.logger.error(f"已添加的标签页: {tab_names}")
+            # 尝试多次强制刷新
+            for i in range(3):
+                settings_window.update()
+                notebook.update()
+                settings_window.update_idletasks()
+                tab_count_after = len(notebook.tabs())
+                if tab_count_after == 5:
+                    self.logger.info(f"第{i+1}次刷新后标签页数量恢复正常: {tab_count_after}")
+                    break
+                elif tab_count_after != tab_count:
+                    self.logger.info(f"第{i+1}次刷新后标签页数量变化: {tab_count} -> {tab_count_after}")
+        else:
+            self.logger.info("所有标签页已成功添加并显示")
+        
+        # 按钮栏
+        btn_frame = ttk.Frame(main_container)
+        btn_frame.pack(fill=X, pady=(15, 0))
+        
+        def validate_int(value: str, name: str, min_val: int, max_val: int) -> tuple:
+            """验证整数输入，返回 (是否有效, 值或错误信息)"""
+            try:
+                val = int(value.strip())
+                if val < min_val or val > max_val:
+                    return False, f"{name} 必须在 {min_val} 到 {max_val} 之间（当前值：{val}）"
+                return True, val
+            except ValueError:
+                return False, f"{name} 必须是有效的整数（当前输入：'{value}'）"
+        
+        def validate_float(value: str, name: str, min_val: float, max_val: float) -> tuple:
+            """验证浮点数输入，返回 (是否有效, 值或错误信息)"""
+            try:
+                val = float(value.strip())
+                if val < min_val or val > max_val:
+                    return False, f"{name} 必须在 {min_val} 到 {max_val} 之间（当前值：{val}）"
+                return True, val
+            except ValueError:
+                return False, f"{name} 必须是有效的数字（当前输入：'{value}'）"
+        
+        def validate_all_inputs() -> tuple:
+            """验证所有输入，返回 (是否全部有效, 错误信息列表, 配置字典)"""
+            errors = []
+            config = {}
+            
+            # TCP 配置验证
+            config["tcp"] = {}
+            
+            ok, result = validate_int(port_var.get(), "TCP端口", 1, 65535)
+            if ok:
+                config["tcp"]["port"] = result
+            else:
+                errors.append(result)
+            
+            ok, result = validate_int(attempts_var.get(), "TCP尝试次数", 1, 50)
+            if ok:
+                config["tcp"]["attempts"] = result
+            else:
+                errors.append(result)
+            
+            ok, result = validate_float(timeout_var.get(), "TCP超时时间", 0.1, 60.0)
+            if ok:
+                config["tcp"]["timeout"] = result
+            else:
+                errors.append(result)
+            
+            ok, result = validate_float(interval_var.get(), "TCP间隔时间", 0.0, 10.0)
+            if ok:
+                config["tcp"]["interval"] = result
+            else:
+                errors.append(result)
+            
+            # TLS 配置验证
+            config["tls"] = {}
+            config["tls"]["enabled"] = tls_enabled_var.get()
+            config["tls"]["verify_hostname"] = verify_hostname_var.get()
+            config["tls"]["strict"] = strict_var.get()
+            
+            ok, result = validate_float(tls_timeout_var.get(), "TLS超时时间", 0.1, 60.0)
+            if ok:
+                config["tls"]["timeout"] = result
+            else:
+                errors.append(result)
+            
+            ok, result = validate_int(try_hosts_limit_var.get(), "尝试域名数量", 1, 20)
+            if ok:
+                config["tls"]["try_hosts_limit"] = result
+            else:
+                errors.append(result)
+            
+            # ICMP 配置验证
+            config["icmp"] = {}
+            config["icmp"]["enabled"] = icmp_enabled_var.get()
+            config["icmp"]["fallback_only"] = fallback_only_var.get()
+            
+            ok, result = validate_int(icmp_timeout_var.get(), "ICMP超时时间(毫秒)", 100, 60000)
+            if ok:
+                config["icmp"]["timeout_ms"] = result
+            else:
+                errors.append(result)
+            
+            # 重试配置验证
+            config["retry"] = {}
+            config["retry"]["enabled"] = retry_enabled_var.get()
+            
+            ok, result = validate_int(max_retries_var.get(), "最大重试次数", 0, 20)
+            if ok:
+                config["retry"]["max_retries"] = result
+            else:
+                errors.append(result)
+            
+            ok, result = validate_float(backoff_factor_var.get(), "退避因子", 0.1, 10.0)
+            if ok:
+                config["retry"]["backoff_factor"] = result
+            else:
+                errors.append(result)
+            
+            # 高级配置（布尔值无需验证）
+            config["advanced"] = {}
+            config["advanced"]["measure_jitter"] = measure_jitter_var.get()
+            config["advanced"]["calculate_stability"] = calculate_stability_var.get()
+            
+            return len(errors) == 0, errors, config
+        
+        def save_config():
+            """保存配置（带输入验证）"""
+            try:
+                # 验证所有输入
+                is_valid, errors, validated_config = validate_all_inputs()
+                
+                if not is_valid:
+                    # 显示所有错误
+                    error_msg = "配置验证失败，请修正以下问题：\n\n"
+                    for i, err in enumerate(errors, 1):
+                        error_msg += f"{i}. {err}\n"
+                    messagebox.showerror("输入验证失败", error_msg)
+                    self.logger.warning(f"配置验证失败: {errors}")
+                    return
+                
+                # 合并配置（保留原有的其他配置项）
+                new_config = self.speed_test_config.copy()
+                
+                # 更新 TCP 配置
+                new_config["tcp"] = new_config.get("tcp", {}).copy()
+                new_config["tcp"].update(validated_config["tcp"])
+                
+                # 更新 TLS 配置（保留 preferred_hosts 等其他配置）
+                new_config["tls"] = new_config.get("tls", {}).copy()
+                new_config["tls"].update(validated_config["tls"])
+                
+                # 更新 ICMP 配置
+                new_config["icmp"] = new_config.get("icmp", {}).copy()
+                new_config["icmp"].update(validated_config["icmp"])
+                
+                # 更新重试配置
+                new_config["retry"] = new_config.get("retry", {}).copy()
+                new_config["retry"].update(validated_config["retry"])
+                
+                # 更新高级配置
+                new_config["advanced"] = new_config.get("advanced", {}).copy()
+                new_config["advanced"].update(validated_config["advanced"])
+                
+                # 保存配置
+                if self.speed_test_config_manager.save_config(new_config):
+                    self.speed_test_config = new_config
+                    self.logger.info("测速配置已保存")
+                    self.logger.info(f"新配置: TCP端口={new_config['tcp']['port']}, "
+                                    f"尝试次数={new_config['tcp']['attempts']}, "
+                                    f"超时={new_config['tcp']['timeout']}秒")
+                    messagebox.showinfo("成功", "配置已保存成功！\n新配置将在下次测速时生效。")
+                    settings_window.destroy()
+                else:
+                    messagebox.showerror("错误", "保存配置失败，请检查日志文件。")
+            except Exception as e:
+                self.logger.exception(f"保存配置时出错: {e}")
+                messagebox.showerror("错误", f"保存配置时发生错误：\n{e}")
+        
+        def reset_to_default():
+            """重置为默认配置"""
+            if messagebox.askyesno("确认", "确定要重置为默认配置吗？"):
+                default_config = self.speed_test_config_manager.reset_to_default()
+                self.speed_test_config = default_config
+                self.logger.info("配置已重置为默认值")
+                messagebox.showinfo("成功", "配置已重置为默认值！")
+                settings_window.destroy()
+                # 重新打开设置窗口以显示默认值
+                self.show_speed_test_settings()
+        
+        ttk.Button(btn_frame, text="重置为默认", command=reset_to_default, bootstyle="warning", width=15).pack(side=LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=settings_window.destroy, bootstyle="secondary", width=15).pack(side=RIGHT, padx=5)
+        ttk.Button(btn_frame, text="保存", command=save_config, bootstyle="success", width=15).pack(side=RIGHT, padx=5)
+        
+        # 绑定 ESC 键关闭窗口
+        settings_window.bind("<Escape>", lambda e: settings_window.destroy())
+        
+        # 延迟设置模态窗口，确保Notebook先显示
+        settings_window.after(100, set_modal)
+        
+        # 最终更新确保所有内容显示
+        settings_window.update_idletasks()
+        settings_window.update()
 
     def load_presets(self):
         """加载域名预设（保持原逻辑）。"""
@@ -699,7 +1621,9 @@ class HostsOptimizer(ttk.Frame):
 
     def refresh_remote_hosts(self):
         if not self.is_github_selected:
+            self.logger.warning("刷新远程Hosts失败：未选择 github.com")
             return
+        self.logger.info("开始刷新远程Hosts...")
         self.refresh_remote_btn.config(state=DISABLED)
         self.progress.configure(mode="indeterminate")
         self.progress.start(10)
@@ -714,16 +1638,20 @@ class HostsOptimizer(ttk.Frame):
         async def fetch_async():
             try:
                 if self.remote_source_url_override:
+                    self.logger.info(f"从指定源获取Hosts: {self.remote_source_url_override}")
                     records, used_url = await self.remote_client.fetch_github_hosts_async(
                         url_override=self.remote_source_url_override,
                         concurrent=False
                     )
                 else:
+                    self.logger.info("从自动源获取Hosts（按优先级）")
                     records, used_url = await self.remote_client.fetch_github_hosts_async(concurrent=True)
                 self.remote_hosts_data = records
                 self.remote_hosts_source_url = used_url
+                self.logger.info(f"成功获取远程Hosts: {len(records)} 条记录，来源: {used_url}")
                 self.master.after(0, self._update_remote_hosts_ui)
             except Exception as e:
+                self.logger.error(f"获取远程Hosts失败: {e}", exc_info=True)
                 self.master.after(0, self.progress.stop)
                 self.master.after(0, lambda: self.progress.configure(mode="determinate", value=0))
                 self.master.after(0, lambda: self.refresh_remote_btn.config(state=NORMAL))
@@ -732,6 +1660,7 @@ class HostsOptimizer(ttk.Frame):
         try:
             asyncio.run(fetch_async())
         except Exception as e:
+            self.logger.exception(f"异步获取远程Hosts时发生异常: {e}")
             self.master.after(0, self.progress.stop)
             self.master.after(0, lambda: self.progress.configure(mode="determinate", value=0))
             self.master.after(0, lambda: self.refresh_remote_btn.config(state=NORMAL))
@@ -832,7 +1761,8 @@ class HostsOptimizer(ttk.Frame):
         use_advanced = bool(self.advanced_metrics_var.get())
 
         # TLS/SNI: 为同一 IP 生成候选域名列表（按优先级），避免只用第一个域名导致误判全失败
-        tls_cfg = SPEED_TEST_CONFIG.get("tls", {}) if isinstance(SPEED_TEST_CONFIG, dict) else {}
+        # 使用自定义配置
+        tls_cfg = self.speed_test_config.get("tls", {}) if isinstance(self.speed_test_config, dict) else {}
         preferred_hosts = tls_cfg.get("preferred_hosts", []) if isinstance(tls_cfg, dict) else []
         try_hosts_limit = int(tls_cfg.get("try_hosts_limit", 3)) if isinstance(tls_cfg, dict) else 3
 
@@ -861,30 +1791,66 @@ class HostsOptimizer(ttk.Frame):
                     out.append(c)
             return out[:max(1, try_hosts_limit)]
         if use_advanced:
+            # 使用自定义配置创建 EnhancedSpeedTester
             tester = EnhancedSpeedTester(
+                config=self.speed_test_config.copy(),  # 传入自定义配置
                 stop_event=self._stop_event,
                 stop_flag=lambda: self.stop_test,
             )
             workers = min(60, max(1, self.total_ip_tests))
             self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
             self._futures = []
+            
+            # 获取 TCP 配置
+            tcp_cfg = self.speed_test_config.get("tcp", {})
+            port = tcp_cfg.get("port", 443)
+            attempts = tcp_cfg.get("attempts", 5)
+            timeout = tcp_cfg.get("timeout", 2.0)
+            
             for ip in ip_list:
                 doms = self._ip_to_domains.get(ip, [])
                 cands = build_sni_candidates(doms)
-                self._futures.append(self.executor.submit(tester.test_with_retry, ip, sni_hosts=cands))
+                self._futures.append(self.executor.submit(
+                    tester.test_with_retry, 
+                    ip, 
+                    sni_hosts=cands,
+                    port=port,
+                    attempts=attempts,
+                    timeout=timeout
+                ))
         else:
+            # 获取 ICMP 配置
+            icmp_cfg = self.speed_test_config.get("icmp", {})
+            icmp_enabled = icmp_cfg.get("enabled", True) and bool(self.icmp_fallback_var.get())
+            
             tester = SpeedTester(
-                icmp_fallback=bool(self.icmp_fallback_var.get()),
+                icmp_fallback=icmp_enabled,
                 stop_event=self._stop_event,
                 stop_flag=lambda: self.stop_test,
             )
             workers = min(60, max(1, self.total_ip_tests))
             self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
             self._futures = []
+            
+            # 获取 TCP 配置
+            tcp_cfg = self.speed_test_config.get("tcp", {})
+            port = tcp_cfg.get("port", 443)
+            attempts = tcp_cfg.get("attempts", 5)
+            timeout = tcp_cfg.get("timeout", 2.0)
+            
             for ip in ip_list:
                 doms = self._ip_to_domains.get(ip, [])
                 cands = build_sni_candidates(doms)
-                self._futures.append(self.executor.submit(tester.test_one_ip, ip, sni_hosts=cands))
+                self._futures.append(self.executor.submit(
+                    tester.test_one_ip, 
+                    ip, 
+                    sni_hosts=cands,
+                    port=port,
+                    attempts=attempts,
+                    timeout=timeout
+                ))
+        
+        self.logger.info(f"开始测速，使用配置: TCP端口={port}, 尝试次数={attempts}, 超时={timeout}秒")
 
         threading.Thread(target=self._collect_speedtest_results, daemon=True).start()
 
@@ -938,6 +1904,12 @@ class HostsOptimizer(ttk.Frame):
 
         self.start_test_btn.config(state=NORMAL)
         self.pause_test_btn.config(state=DISABLED)
+        
+        # 如果是定时测速，执行回调
+        if self._is_scheduled_test_running:
+            self._is_scheduled_test_running = False
+            self._on_scheduled_test_complete()
+            self._schedule_next_test()
 
     def _add_test_results_batch(self, rows, ip_completed_increment: int = 0):
         for row in rows:
@@ -1133,25 +2105,29 @@ class HostsOptimizer(ttk.Frame):
         self._do_write(sel)
 
     def _do_write(self, records: List[Tuple[str, str]]):
+        self.logger.info(f"开始写入Hosts文件，共 {len(records)} 条记录")
         try:
             # UI 提示：即便未管理员也先提示（写入时可能触发自动提权）
             if not is_admin(probe_path=HOSTS_PATH):
+                self.logger.warning("当前没有管理员权限，将尝试自动提权")
                 self._toast("提示", "当前没有管理员权限，将尝试写入Hosts文件...", bootstyle="info", duration=2000)
 
             # 1) 读取原 hosts + 备份
             content, enc = self.hosts_mgr.read_hosts_text()
             bak_path = self.hosts_mgr.create_backup()
+            self.logger.info(f"已创建备份文件: {bak_path}")
             try:
                 self.rollback_hosts_btn.config(state=NORMAL)
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"更新回滚按钮状态失败: {e}")
 
             # 2) 移除旧标记块（安全策略）
             rm = self.hosts_mgr.remove_existing_smart_block(content)
             if rm.marker_damaged:
+                self.logger.warning("检测到Hosts标记可能损坏（Start/End不成对），采用安全写入策略")
                 self._toast(
                     "提示",
-                    "检测到 Hosts 标记可能损坏（Start/End 不成对）。已采用安全写入：不删除旧段，仅追加新段。必要时可点击“回滚 Hosts”。",
+                    "检测到 Hosts 标记可能损坏（Start/End 不成对）。已采用安全写入：不删除旧段，仅追加新段。必要时可点击\"回滚 Hosts\"。",
                     bootstyle="warning",
                     duration=4500,
                 )
@@ -1161,15 +2137,19 @@ class HostsOptimizer(ttk.Frame):
             final_text = rm.content.rstrip() + blk
 
             # 4) 多方案写入（权限不足时可自动提权）
+            self.logger.info(f"开始写入Hosts文件（编码: {enc}）")
             self.hosts_mgr.write_hosts_atomic(
                 final_text,
                 encoding=enc,
                 allow_elevate=True,
                 on_need_elevation=lambda: self._toast("权限不足", "写入Hosts文件需要管理员权限，将自动尝试提权...", bootstyle="warning", duration=3000),
             )
+            self.logger.info("Hosts文件写入成功")
 
             # 5) 刷新 DNS
+            self.logger.info("刷新DNS缓存...")
             self.hosts_mgr.flush_dns_cache()
+            self.logger.info("DNS缓存刷新成功")
 
             messagebox.showinfo(
                 "成功",
@@ -1177,14 +2157,16 @@ class HostsOptimizer(ttk.Frame):
                 f"写入前已自动备份：\n{bak_path}\n\n"
                 f"备份目录：{self.hosts_mgr.backup_dir}\n"
                 f"备份文件格式：hosts_YYYYMMDD_HHMMSS.bak\n\n"
-                "如需恢复，请点击底部“回滚 Hosts”。",
+                "如需恢复，请点击底部\"回滚 Hosts\"。",
             )
             self.status_label.config(text="Hosts文件已更新（已备份）", bootstyle=SUCCESS)
         except Exception as e:
             if "permission denied" in str(e).lower() or "拒绝访问" in str(e):
+                self.logger.error(f"写入Hosts文件失败（权限不足）: {e}", exc_info=True)
                 self._toast("权限不足", "写入Hosts文件失败，请以管理员身份运行程序", bootstyle="warning", duration=3000)
                 messagebox.showerror("权限不足", f"写入Hosts文件失败: {e}\n请以管理员身份运行程序")
             else:
+                self.logger.error(f"写入Hosts文件失败: {e}", exc_info=True)
                 messagebox.showerror("错误", f"写入Hosts文件失败: {e}")
 
     def rollback_hosts(self):
